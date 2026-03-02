@@ -7488,19 +7488,87 @@
             try {
                 showLoading('Salvando fazenda...');
                 
-                const farmData = {
-                    name,
-                    geoJson: currentFarmGeoJson,
-                    status: 'active',
+                const timestamps = {
                     createdAt: new Date().toISOString(),
                     updatedAt: new Date().toISOString()
                 };
                 
-                // Save to local DB
-                const id = await db.farms.add(farmData);
+                const farmData = {
+                    name,
+                    geoJson: currentFarmGeoJson,
+                    status: 'active',
+                    ...timestamps
+                };
                 
-                // Add to sync queue
-                await addToSyncQueue('add', 'farms', id, { ...farmData, id });
+                const farmSyncData = {
+                    name,
+                    status: 'active',
+                    ...timestamps
+                };
+                
+                const id = await db.farms.add(farmData);
+
+                // Generate suggested route from KML
+                if (currentFarmGeoJson) {
+                    try {
+                        let routePath = [];
+                        let hasRoute = false;
+
+                        // Try LineString
+                        const lineStringFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'LineString');
+                        if (lineStringFeature) {
+                             routePath = lineStringFeature.geometry.coordinates.map(c => ({
+                                lat: c[1],
+                                lng: c[0],
+                                timestamp: Date.now()
+                            }));
+                            hasRoute = true;
+                        } else {
+                            // Try Polygon (Perimeter)
+                            const polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'Polygon');
+                            if (polygonFeature) {
+                                const ring = polygonFeature.geometry.coordinates[0];
+                                if (ring && ring.length > 0) {
+                                     routePath = ring.map(c => ({
+                                        lat: c[1],
+                                        lng: c[0],
+                                        timestamp: Date.now()
+                                    }));
+                                    hasRoute = true;
+                                }
+                            }
+                        }
+
+                        if (hasRoute && routePath.length > 0) {
+                             let distance = 0;
+                             // Calculate distance if haversineDistance is available
+                             if (typeof haversineDistance === 'function') {
+                                 for(let i=0; i<routePath.length-1; i++) {
+                                     distance += haversineDistance(routePath[i].lat, routePath[i].lng, routePath[i+1].lat, routePath[i+1].lng);
+                                 }
+                             }
+
+                             const suggestedRoute = {
+                                name: `Rota Sugerida - ${name}`,
+                                frontId: 0, 
+                                startTime: new Date().toISOString(),
+                                status: 'active', 
+                                tags: ['sugerida', 'kml', 'auto-generated'],
+                                path: routePath,
+                                distance: distance,
+                                createdAt: new Date().toISOString(),
+                                updatedAt: new Date().toISOString()
+                            };
+                            
+                            await db.routes.add(suggestedRoute);
+                            // We don't sync this route yet as it's local/suggested
+                        }
+                    } catch (e) {
+                        console.error('Erro ao gerar rota sugerida:', e);
+                    }
+                }
+                
+                await addToSyncQueue('add', 'farms', id, { ...farmSyncData, id });
                 
                 hideLoading();
                 showToast('Fazenda cadastrada com sucesso!', 'success');
@@ -7550,7 +7618,7 @@
             if (fileNameElement) fileNameElement.textContent = file.name;
             
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 try {
                     const kmlText = e.target.result;
                     const parser = new DOMParser();
@@ -7584,6 +7652,26 @@
                         const bounds = currentRecording.kmlLayer.getBounds();
                         if (bounds.isValid()) {
                             currentRecording.map.fitBounds(bounds);
+                        }
+
+                        // Check if routes exist
+                        const routesCount = await db.routes.count();
+                        if (routesCount > 0) {
+                            showToast('Rotas já cadastradas. Nenhuma rota sugerida foi gerada.', 'info');
+                            return;
+                        }
+
+                        // Try to use LineString from KML as route
+                        const lineStringFeature = geojson.features.find(f => f.geometry.type === 'LineString');
+                        if (lineStringFeature) {
+                            const coordinates = lineStringFeature.geometry.coordinates.map(c => [c[1], c[0]]);
+                            currentRecording.suggestedRouteLayer = L.polyline(coordinates, {
+                                color: '#3b82f6',
+                                weight: 5,
+                                opacity: 0.8
+                            }).addTo(currentRecording.map);
+                            showToast('Rota sugerida extraída do KML.', 'success');
+                            return;
                         }
                         
                         const userLatLng = currentRecording.lastLocation
@@ -7734,6 +7822,30 @@
                 
                 currentRecording.pendingKml = null;
             }
+
+            // Load farms to display on map
+            db.farms.toArray().then(farms => {
+                if (farms && farms.length > 0) {
+                    farms.forEach(farm => {
+                        if (farm.geoJson) {
+                            try {
+                                L.geoJSON(farm.geoJson, {
+                                    style: {
+                                        color: '#10B981',
+                                        weight: 2,
+                                        opacity: 0.5,
+                                        fillOpacity: 0.1,
+                                        dashArray: '5, 5'
+                                    },
+                                    interactive: false // Don't interfere with recording clicks
+                                }).addTo(map);
+                            } catch (e) {
+                                console.error('Erro ao adicionar fazenda ao mapa de gravação:', e);
+                            }
+                        }
+                    });
+                }
+            }).catch(err => console.error('Erro ao carregar fazendas:', err));
             
             // Try to center map on user's current location
             if (navigator.geolocation) {
@@ -8196,125 +8308,118 @@
                 }
 
                 const map = L.map(mapContainer).setView([-15.7801, -47.9292], 5);
+                window.operationsMap = map;
                 
                 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                 }).addTo(map);
                 
-                // Load active routes and display them on the map
-                db.routes.where('status').equals('active').toArray().then(routes => {
-                    // Process route paths for any that might be compressed
+                // Load data in parallel
+                Promise.all([
+                    db.routes.where('status').equals('active').toArray(),
+                    db.harvestFronts.toArray(),
+                    db.farms.toArray()
+                ]).then(([routes, fronts, farms]) => {
+                    const bounds = L.latLngBounds([]);
+                    let hasVisibleItems = false;
+                    
+                    // Process route paths
                     routes.forEach(route => {
                         if (route.path && route.path._compressed) {
                             route.path = decompressPathData(route.path);
                         }
                     });
                     
-                    // Load fronts
-                    db.harvestFronts.toArray().then(fronts => {
-                        // Load farms
-                        db.farms.toArray().then(farms => {
-                            const bounds = L.latLngBounds([]);
-                            let hasVisibleItems = false;
-                            
-                            // Add farms to map
-                            farms.forEach(farm => {
-                                if (farm.geoJson) {
-                                    try {
-                                        const farmLayer = L.geoJSON(farm.geoJson, {
-                                            style: {
-                                                color: '#10B981', // Emerald 500
-                                                weight: 2,
-                                                opacity: 0.8,
-                                                fillColor: '#34D399', // Emerald 400
-                                                fillOpacity: 0.2
-                                            },
-                                            onEachFeature: (feature, layer) => {
-                                                layer.bindTooltip(`Fazenda: ${farm.name}`, { sticky: true });
-                                                layer.on('click', () => {
-                                                    // Optional: Show farm details
-                                                    showToast(`Fazenda: ${farm.name}`, 'info');
-                                                });
-                                            }
-                                        }).addTo(map);
-                                        
-                                        bounds.extend(farmLayer.getBounds());
-                                        hasVisibleItems = true;
-                                    } catch (e) {
-                                        console.error(`Erro ao adicionar fazenda ${farm.name} ao mapa:`, e);
-                                    }
-                                }
-                            });
-                            
-                            // Add each route to the map
-                            routes.forEach(route => {
-                                if (!route.path || route.path.length < 2) return;
-                                
-                                const front = fronts.find(f => f.id === route.frontId);
-                                if (!front) return;
-                                
-                                // Create polyline for route
-                                const routePath = route.path.map(point => [point.lat, point.lng]);
-                                
-                                // Draw the route
-                                const routePolyline = L.polyline(routePath, {
-                                    color: front.color,
-                                    opacity: 0.8,
-                                    weight: 4
-                                }).addTo(map);
-                                
-                                // Add start and end markers
-                                const startPoint = routePath[0];
-                                const endPoint = routePath[routePath.length - 1];
-                                
-                                // Start marker
-                                L.circleMarker(startPoint, {
-                                    radius: 8,
-                                    fillColor: front.color,
-                                    fillOpacity: 1,
-                                    color: '#FFFFFF',
-                                    weight: 2
-                                }).addTo(map).bindTooltip(`Início: ${route.name || 'Rota sem nome'}`);
-                                
-                                // End marker
-                                L.circleMarker(endPoint, {
-                                    radius: 8,
-                                    fillColor: '#e74c3c',
-                                    fillOpacity: 1,
-                                    color: '#FFFFFF',
-                                    weight: 2
-                                }).addTo(map).bindTooltip(`Fim: ${route.name || 'Rota sem nome'}`);
-                                
-                                // Extend bounds
-                                routePath.forEach(point => bounds.extend(point));
-                                hasVisibleItems = true;
-                                
-                                // Add click listener
-                                routePolyline.on('click', () => {
-                                    viewRouteDetails(route.frontId, route.id);
-                                });
-                            });
-                            
-                            // Fit map to bounds
-                            if (hasVisibleItems && bounds.isValid()) {
-                                map.fitBounds(bounds, { padding: [30, 30] });
-                            } else {
-                                // Try to get user's location if nothing visible
-                                if (navigator.geolocation) {
-                                    navigator.geolocation.getCurrentPosition(
-                                        position => {
-                                            map.setView([position.coords.latitude, position.coords.longitude], 10);
+                    // Add farms to map
+                    if (farms && farms.length > 0) {
+                        farms.forEach(farm => {
+                            if (farm.geoJson) {
+                                try {
+                                    const farmLayer = L.geoJSON(farm.geoJson, {
+                                        style: {
+                                            color: '#10B981', // Emerald 500
+                                            weight: 2,
+                                            opacity: 0.8,
+                                            fillColor: '#34D399', // Emerald 400
+                                            fillOpacity: 0.2
                                         },
-                                        () => { /* Do nothing on error */ }
-                                    );
+                                        onEachFeature: (feature, layer) => {
+                                            layer.bindTooltip(`Fazenda: ${farm.name}`, { sticky: true });
+                                            layer.on('click', () => {
+                                                showToast(`Fazenda: ${farm.name}`, 'info');
+                                            });
+                                        }
+                                    }).addTo(map);
+                                    
+                                    bounds.extend(farmLayer.getBounds());
+                                    hasVisibleItems = true;
+                                } catch (e) {
+                                    console.error(`Erro ao adicionar fazenda ${farm.name} ao mapa:`, e);
                                 }
                             }
                         });
-                    });
+                    }
+                    
+                    // Add routes to map
+                    if (routes && routes.length > 0) {
+                        routes.forEach(route => {
+                            if (!route.path || route.path.length < 2) return;
+                            
+                            const front = fronts.find(f => f.id === route.frontId);
+                            // If front not found, use default color
+                            const color = front ? front.color : '#5D5CDE';
+                            
+                            const routePath = route.path.map(point => [point.lat, point.lng]);
+                            
+                            const routePolyline = L.polyline(routePath, {
+                                color: color,
+                                opacity: 0.8,
+                                weight: 4
+                            }).addTo(map);
+                            
+                            const startPoint = routePath[0];
+                            const endPoint = routePath[routePath.length - 1];
+                            
+                            L.circleMarker(startPoint, {
+                                radius: 8,
+                                fillColor: color,
+                                fillOpacity: 1,
+                                color: '#FFFFFF',
+                                weight: 2
+                            }).addTo(map).bindTooltip(`Início: ${route.name || 'Rota sem nome'}`);
+                            
+                            L.circleMarker(endPoint, {
+                                radius: 8,
+                                fillColor: '#e74c3c',
+                                fillOpacity: 1,
+                                color: '#FFFFFF',
+                                weight: 2
+                            }).addTo(map).bindTooltip(`Fim: ${route.name || 'Rota sem nome'}`);
+                            
+                            routePath.forEach(point => bounds.extend(point));
+                            hasVisibleItems = true;
+                            
+                            routePolyline.on('click', () => {
+                                viewRouteDetails(route.frontId, route.id);
+                            });
+                        });
+                    }
+                    
+                    if (hasVisibleItems && bounds.isValid()) {
+                        map.fitBounds(bounds, { padding: [30, 30] });
+                    } else {
+                        if (navigator.geolocation) {
+                            navigator.geolocation.getCurrentPosition(
+                                position => {
+                                    map.setView([position.coords.latitude, position.coords.longitude], 10);
+                                },
+                                () => { /* Do nothing on error */ }
+                            );
+                        }
+                    }
+                }).catch(err => {
+                    console.error('Erro ao carregar dados do mapa:', err);
                 });
-                
-                // Store map in global state
-                window.operationsMap = map;
                 
             } catch (error) {
                 console.error('Erro ao inicializar mapa de operações:', error);
