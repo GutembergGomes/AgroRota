@@ -2647,18 +2647,24 @@
                                                         <i class="fas fa-user mr-1"></i> ${assignedDrivers.length} motoristas
                                                     </div>
                                                 </div>
-                                                <div class="flex flex-wrap gap-2">
-                                                    <button onclick="recordRoute(${front.id})" class="px-3 py-2 bg-primary-500 hover:bg-primary-600 text-white rounded-lg flex-1 text-sm flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
-                                                        <i class="fas fa-route mr-2"></i> Registrar Rota
+                                                <div class="flex flex-wrap gap-2 items-center">
+                                                    <button onclick="recordRoute(${front.id})" class="flex-1 px-3 py-2 bg-primary-500 hover:bg-primary-600 text-white rounded-lg text-sm flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
+                                                        <i class="fas fa-route mr-2"></i> Registrar
                                                     </button>
+                                                    
+                                                    <button onclick="editHarvestFront(${front.id})" class="p-2 text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400 bg-gray-100 dark:bg-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-500" title="Editar">
+                                                        <i class="fas fa-pencil-alt"></i>
+                                                    </button>
+                                                    
+                                                    <button onclick="deleteHarvestFront(${front.id})" class="p-2 text-gray-500 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400 bg-gray-100 dark:bg-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-500" title="Excluir">
+                                                        <i class="fas fa-trash"></i>
+                                                    </button>
+
                                                     <div class="dropdown relative">
-                                                        <button class="dropdown-toggle p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 bg-gray-100 dark:bg-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-500">
+                                                        <button onclick="toggleDropdown(event, this)" class="dropdown-toggle p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 bg-gray-100 dark:bg-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-500" title="Mais opções">
                                                             <i class="fas fa-ellipsis-v"></i>
                                                         </button>
-                                                        <div class="dropdown-menu hidden absolute right-0 mt-2 w-48 bg-white dark:bg-gray-800 rounded-md shadow-lg py-1 z-10">
-                                                            <button onclick="editHarvestFront(${front.id})" class="block w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700">
-                                                                <i class="fas fa-pencil-alt mr-2"></i> Editar
-                                                            </button>
+                                                        <div class="dropdown-menu hidden absolute right-0 mt-2 w-48 bg-white dark:bg-gray-800 rounded-md shadow-lg py-1 z-50 ring-1 ring-black ring-opacity-5">
                                                             <button onclick="viewFrontDetails(${front.id})" class="block w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700">
                                                                 <i class="fas fa-info-circle mr-2"></i> Detalhes
                                                             </button>
@@ -2667,10 +2673,6 @@
                                                             </button>
                                                             <button onclick="toggleFrontStatus(${front.id}, '${front.status === 'active' ? 'inactive' : 'active'}')" class="block w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700">
                                                                 <i class="fas fa-${front.status === 'active' ? 'pause' : 'play'} mr-2"></i> ${front.status === 'active' ? 'Desativar' : 'Ativar'}
-                                                            </button>
-                                                            <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
-                                                            <button onclick="deleteHarvestFront(${front.id})" class="block w-full text-left px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20">
-                                                                <i class="fas fa-trash mr-2"></i> Excluir
                                                             </button>
                                                         </div>
                                                     </div>
@@ -2706,29 +2708,7 @@
                     </div>
                 `;
                 
-                // Set up dropdown toggles
-                const dropdownButtons = document.querySelectorAll('.dropdown-toggle');
-                dropdownButtons.forEach(button => {
-                    button.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        const dropdown = button.nextElementSibling;
-                        dropdown.classList.toggle('hidden');
-                        
-                        // Close other dropdowns
-                        document.querySelectorAll('.dropdown-menu:not(.hidden)').forEach(menu => {
-                            if (menu !== dropdown) {
-                                menu.classList.add('hidden');
-                            }
-                        });
-                    });
-                });
-                
-                // Close dropdowns when clicking outside
-                document.addEventListener('click', () => {
-                    document.querySelectorAll('.dropdown-menu').forEach(menu => {
-                        menu.classList.add('hidden');
-                    });
-                });
+                // Dropdown logic is now handled by toggleDropdown global function
                 
                 // Set up search and filtering
                 const searchInput = document.getElementById('frontSearch');
@@ -2854,6 +2834,29 @@
             }
         }
         
+        function toggleDropdown(event, button) {
+            event.stopPropagation();
+            const dropdown = button.nextElementSibling;
+            
+            // Close all other dropdowns
+            document.querySelectorAll('.dropdown-menu').forEach(menu => {
+                if (menu !== dropdown) {
+                    menu.classList.add('hidden');
+                }
+            });
+            
+            if (dropdown) {
+                dropdown.classList.toggle('hidden');
+            }
+        }
+        
+        // Close dropdowns when clicking outside
+        document.addEventListener('click', () => {
+            document.querySelectorAll('.dropdown-menu').forEach(menu => {
+                menu.classList.add('hidden');
+            });
+        });
+
         function editHarvestFront(id) {
             renderEditHarvestFrontView(id);
         }
@@ -4181,12 +4184,19 @@
                 appView.dataset.frontId = frontId;
                 appView.dataset.routeId = routeId;
                 
-                const startDate = new Date(route.startTime);
+                // Robust date handling
+                const rawStartDate = route.startTime || route.createdAt || new Date();
+                const startDate = new Date(rawStartDate);
                 const endDate = route.endTime ? new Date(route.endTime) : null;
-                const duration = endDate ? (endDate - startDate) / (1000 * 60) : null; // Minutes
+                
+                const isValidStart = !isNaN(startDate.getTime());
+                const isValidEnd = endDate && !isNaN(endDate.getTime());
+                
+                const duration = (isValidStart && isValidEnd) ? (endDate - startDate) / (1000 * 60) : null;
+                const formattedDate = isValidStart ? startDate.toLocaleString('pt-BR') : 'Data desconhecida';
                 
                 // Calculate distance if not already set
-                let distance = route.distance;
+                let distance = route.distance || 0;
                 if (!distance && route.path && route.path.length >= 2) {
                     distance = calculateRouteDistance(route.path);
                     // Update route in database with calculated distance
@@ -4357,7 +4367,7 @@
                                         ` : ''}
                                         <div class="flex justify-between">
                                             <span class="text-gray-500 dark:text-gray-400">Data e Hora</span>
-                                            <span>${startDate.toLocaleDateString()} ${startDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                                            <span>${formattedDate} ${isValidStart ? startDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : ''}</span>
                                         </div>
                                         ${duration ? `
                                             <div class="flex justify-between">
@@ -4375,8 +4385,8 @@
                                         </div>
                                         <div class="flex justify-between">
                                             <span class="text-gray-500 dark:text-gray-400">Status</span>
-                                            <span class="status-badge ${getStatusClass(route.status)}">
-                                                ${getStatusText(route.status)}
+                                            <span class="status-badge ${getStatusClass(route.status || 'active')}">
+                                                ${getStatusText(route.status || 'active')}
                                             </span>
                                         </div>
                                         
@@ -6951,7 +6961,9 @@
                     if (suggestedRoutes.length > 0) {
                         for (const route of suggestedRoutes) {
                             await db.routes.update(route.id, { frontId: id });
-                            await addToSyncQueue('update', 'routes', route.id, { frontId: id });
+                            // Fetch updated route to sync FULL object, preventing data loss
+                            const updatedRoute = await db.routes.get(route.id);
+                            await addToSyncQueue('update', 'routes', route.id, updatedRoute);
                         }
                         showToast(`${suggestedRoutes.length} rota(s) sugerida(s) vinculada(s).`, 'info');
                     }
@@ -7733,8 +7745,12 @@
                             }));
                             hasRoute = true;
                         } else {
-                            // Try Polygon -> Calculate route from Usina Cambuí
-                            const polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'Polygon');
+                            // Try Polygon or MultiPolygon -> Calculate route from Usina Cambuí
+                            let polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'Polygon');
+                            if (!polygonFeature) {
+                                polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'MultiPolygon');
+                            }
+                            
                             if (polygonFeature) {
                                 // Coordenadas da Usina Cambuí (Fornecidas pelo usuário)
                                 const USINA_CAMBUI_LOCATION = { lat: -17.924714302556936, lng: -50.63708775318097 };
@@ -7760,7 +7776,13 @@
                                         hasRoute = true;
                                     } else {
                                         // Fallback to perimeter
-                                        const ring = polygonFeature.geometry.coordinates[0];
+                                        let ring = [];
+                                        if (polygonFeature.geometry.type === 'Polygon') {
+                                            ring = polygonFeature.geometry.coordinates[0];
+                                        } else if (polygonFeature.geometry.type === 'MultiPolygon') {
+                                            ring = polygonFeature.geometry.coordinates[0][0];
+                                        }
+                                        
                                         if (ring && ring.length > 0) {
                                              routePath = ring.map(c => ({
                                                 lat: c[1],
@@ -7772,7 +7794,13 @@
                                     }
                                 } catch (err) {
                                     console.error('Erro ao calcular rota da Usina:', err);
-                                    const ring = polygonFeature.geometry.coordinates[0];
+                                    let ring = [];
+                                    if (polygonFeature.geometry.type === 'Polygon') {
+                                        ring = polygonFeature.geometry.coordinates[0];
+                                    } else if (polygonFeature.geometry.type === 'MultiPolygon') {
+                                        ring = polygonFeature.geometry.coordinates[0][0];
+                                    }
+                                    
                                     if (ring && ring.length > 0) {
                                          routePath = ring.map(c => ({
                                             lat: c[1],
@@ -7808,8 +7836,11 @@
                                 updatedAt: new Date().toISOString()
                             };
                             
-                            await db.routes.add(suggestedRoute);
-                            // We don't sync this route yet as it's local/suggested
+                            const routeId = await db.routes.add(suggestedRoute);
+                            // Important: Sync the route immediately to Firestore. 
+                            // If we don't, subsequent updates (like linking to a front) will create a partial document in Firestore,
+                            // which then syncs back and overwrites the local route with empty data.
+                            await addToSyncQueue('add', 'routes', routeId, { ...suggestedRoute, id: routeId });
                         }
                     } catch (e) {
                         console.error('Erro ao gerar rota sugerida:', e);
