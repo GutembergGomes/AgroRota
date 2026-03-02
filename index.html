@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HarvestManager - Gestão de Transporte Agrícola</title>
+    <title>AgroRota - Gestão de Transporte Agrícola</title>
     <meta name="description" content="Sistema de gestão para transporte agrícola, frentes de colheita e motoristas">
     <meta name="theme-color" content="#5D5CDE">
     <link rel="manifest" href="manifest.json">
@@ -439,8 +439,13 @@
             <div class="container mx-auto px-4 py-3">
                 <div class="flex items-center justify-between">
                     <div class="flex items-center space-x-2">
-                        <img src="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.2.1/svgs/solid/tractor.svg" alt="Logo" class="w-8 h-8 text-primary-500">
-                        <h1 class="text-xl font-bold text-primary-500">HarvestManager</h1>
+                        <div class="flex items-center justify-center w-10 h-10 bg-primary-500 rounded-lg shadow-inner">
+                            <span class="text-white font-bold text-xl tracking-tighter">GG</span>
+                        </div>
+                        <div class="flex flex-col">
+                            <h1 class="text-xl font-black text-primary-500 leading-none">AgroRota</h1>
+                            <span class="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-[0.2em] leading-tight">Ggomes Log</span>
+                        </div>
                     </div>
                     <div class="flex items-center space-x-4">
                         <button id="darkModeToggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500" aria-label="Alternar modo escuro">
@@ -584,7 +589,7 @@
         
         // Database setup with improved schema and indexing
         // Mudando nome do banco para garantir que inicie zerado (nova versão sem dados antigos)
-        const db = new Dexie('HarvestManagerDB_Prod');
+        const db = new Dexie('AgroRotaDB_Prod');
         db.version(2).stores({
             harvestFronts: '++id, name, status, createdAt, updatedAt',
             routes: '++id, frontId, startTime, status, createdAt, updatedAt, *tags',
