@@ -771,7 +771,9 @@
                     if (error) throw error;
                     
                     if (data && data.length > 0) {
-                        const validData = data.filter(item => !isNaN(item.id) || /^\d+$/.test(item.id));
+                        const validData = dexieTableName === 'users' 
+                            ? data 
+                            : data.filter(item => !isNaN(item.id) || /^\d+$/.test(item.id));
                         const camelData = validData.map(item => snakeToCamel(item));
                         
                         // Use a transaction for better performance and consistency
@@ -2677,7 +2679,7 @@
                 });
                 
                 // Process pending items
-                await processOfflineActions();
+                await processSyncQueue();
                 
                 hideLoading();
                 
