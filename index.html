@@ -793,117 +793,123 @@
         }
 
         // Sync queue processing - Improved to sync with Supabase
+        let isSyncing = false;
         async function processSyncQueue() {
-            if (!navigator.onLine) return;
+            if (!navigator.onLine || isSyncing) return;
             
-            console.log(`[Sync] Verificando fila de sincronização em ${db.name}...`);
+            try {
+                isSyncing = true;
+                console.log(`[Sync] Iniciando processamento da fila...`);
             
-            // Priority order for tables to avoid foreign key violations
-            const priorityOrder = {
-                'farms': 1,
-                'harvestFronts': 2,
-                'drivers': 3,
-                'routes': 4
-            };
-            
-            let queueItems = await db.syncQueue.orderBy('timestamp').toArray();
-            if (queueItems.length === 0) {
-                console.log('[Sync] Fila vazia.');
-                return;
-            }
-            
-            // Sort by priority then by timestamp
-            queueItems.sort((a, b) => {
-                const prioA = priorityOrder[a.tableName] || 99;
-                const prioB = priorityOrder[b.tableName] || 99;
-                if (prioA !== prioB) return prioA - prioB;
-                return new Date(a.timestamp) - new Date(b.timestamp);
-            });
-            
-            console.log(`[Sync] Processando ${queueItems.length} itens...`);
-            
-            const { data: { session } } = await supabaseClient.auth.getSession();
-            
-            if (!session) {
-                console.warn('[Sync] Usuário não autenticado, adiando sincronização.');
-                return;
-            }
-            
-            for (const item of queueItems) {
-                try {
-                    // Skip if already processing
-                    if (item.status === 'processing') continue;
-                    
-                    // Validação de ID: Se não for numérico, ignorar itens antigos que causam erro de bigint
-                    const isNumericId = !isNaN(item.itemId) || /^\d+$/.test(item.itemId);
-                    if (!isNumericId) {
-                        console.error(`[Sync] Item ${item.id} ignorado por ID inválido (não-numérico): ${item.itemId}`);
-                        await db.syncQueue.delete(item.id);
-                        continue;
-                    }
-                    
-                    // Mark as processing
-                    await db.syncQueue.update(item.id, { status: 'processing' });
-                    
-                    const supabaseTableName = TABLE_MAP[item.tableName] || item.tableName;
-                    const syncData = camelToSnake(item.data);
-                    
-                    if (item.action === 'create' || item.action === 'update' || item.action === 'add') {
-                        // Limpar campos que não devem ir para o Supabase
-                        const cleanSyncData = { ...syncData };
-                        delete cleanSyncData.id; 
-
-                        console.log(`[Sync] Enviando ${item.action} para ${supabaseTableName} (ID: ${item.itemId})`);
-
-                        const { error } = await supabaseClient
-                            .from(supabaseTableName)
-                            .upsert({ ...cleanSyncData, id: item.itemId });
+                // Priority order for tables to avoid foreign key violations
+                const priorityOrder = {
+                    'farms': 1,
+                    'harvestFronts': 2,
+                    'drivers': 3,
+                    'routes': 4
+                };
+                
+                let queueItems = await db.syncQueue.orderBy('timestamp').toArray();
+                if (queueItems.length === 0) {
+                    console.log('[Sync] Fila vazia.');
+                    return;
+                }
+                
+                // Sort by priority then by timestamp
+                queueItems.sort((a, b) => {
+                    const prioA = priorityOrder[a.tableName] || 99;
+                    const prioB = priorityOrder[b.tableName] || 99;
+                    if (prioA !== prioB) return prioA - prioB;
+                    return new Date(a.timestamp) - new Date(b.timestamp);
+                });
+                
+                console.log(`[Sync] Processando ${queueItems.length} itens...`);
+                
+                const { data: { session } } = await supabaseClient.auth.getSession();
+                
+                if (!session) {
+                    console.warn('[Sync] Usuário não autenticado, adiando sincronização.');
+                    return;
+                }
+                
+                for (const item of queueItems) {
+                    try {
+                        // Skip if already processing
+                        if (item.status === 'processing') continue;
                         
-                        if (error) {
-                            // Se for erro de sintaxe de tipo (ID inválido no servidor), deletar da fila para não travar
-                            if (error.code === '22P02') {
-                                console.error(`[Sync] Erro de tipo (bigint) para ID ${item.itemId}. Removendo da fila.`);
-                                await db.syncQueue.delete(item.id);
-                                continue;
-                            }
-                            // Se for erro de chave estrangeira (23503), vamos tentar novamente mais tarde
-                            if (error.code === '23503') {
-                                console.warn(`[Sync] Erro FK para ${item.tableName}/${item.itemId}, aguardando dependência.`);
-                                await db.syncQueue.update(item.id, { 
-                                    status: 'pending', 
-                                    retries: (item.retries || 0) + 1,
-                                    error: 'Foreign key violation'
-                                });
-                                continue;
-                            }
-                            throw error;
+                        // Validação de ID: Se não for numérico, ignorar itens antigos que causam erro de bigint
+                        const isNumericId = !isNaN(item.itemId) || /^\d+$/.test(item.itemId);
+                        if (!isNumericId) {
+                            console.error(`[Sync] Item ${item.id} ignorado por ID inválido (não-numérico): ${item.itemId}`);
+                            await db.syncQueue.delete(item.id);
+                            continue;
                         }
-                        console.log(`[Sync] Sucesso: ${item.tableName}/${item.itemId}`);
-                    } else if (item.action === 'delete') {
-                        const { error } = await supabaseClient
-                            .from(supabaseTableName)
-                            .delete()
-                            .eq('id', item.itemId);
-                        if (error) throw error;
-                        console.log(`[Sync] Deletado: ${item.tableName}/${item.itemId}`);
-                    }
-                    
-                    // If successful, remove from queue
-                    await db.syncQueue.delete(item.id);
-                    
-                } catch (error) {
-                    console.error(`[Sync] Erro crítico no item ${item.id}:`, error);
-                    
-                    // Increment retries or fail
-                    if (item.retries >= 5) {
-                        await db.syncQueue.update(item.id, { status: 'failed', error: error.message });
-                    } else {
-                        await db.syncQueue.update(item.id, { 
-                            status: 'pending', 
-                            retries: (item.retries || 0) + 1 
-                        });
+                        
+                        // Mark as processing
+                        await db.syncQueue.update(item.id, { status: 'processing' });
+                        
+                        const supabaseTableName = TABLE_MAP[item.tableName] || item.tableName;
+                        const syncData = camelToSnake(item.data);
+                        
+                        if (item.action === 'create' || item.action === 'update' || item.action === 'add') {
+                            // Limpar campos que não devem ir para o Supabase
+                            const cleanSyncData = { ...syncData };
+                            delete cleanSyncData.id; 
+
+                            console.log(`[Sync] Enviando ${item.action} para ${supabaseTableName} (ID: ${item.itemId})`);
+
+                            const { error } = await supabaseClient
+                                .from(supabaseTableName)
+                                .upsert({ ...cleanSyncData, id: item.itemId });
+                            
+                            if (error) {
+                                // Se for erro de sintaxe de tipo (ID inválido no servidor), deletar da fila para não travar
+                                if (error.code === '22P02') {
+                                    console.error(`[Sync] Erro de tipo (bigint) para ID ${item.itemId}. Removendo da fila.`);
+                                    await db.syncQueue.delete(item.id);
+                                    continue;
+                                }
+                                // Se for erro de chave estrangeira (23503), vamos tentar novamente mais tarde
+                                if (error.code === '23503') {
+                                    console.warn(`[Sync] Erro FK para ${item.tableName}/${item.itemId}, aguardando dependência.`);
+                                    await db.syncQueue.update(item.id, { 
+                                        status: 'pending', 
+                                        retries: (item.retries || 0) + 1,
+                                        error: 'Foreign key violation'
+                                    });
+                                    continue;
+                                }
+                                throw error;
+                            }
+                            console.log(`[Sync] Sucesso: ${item.tableName}/${item.itemId}`);
+                        } else if (item.action === 'delete') {
+                            const { error } = await supabaseClient
+                                .from(supabaseTableName)
+                                .delete()
+                                .eq('id', item.itemId);
+                            if (error) throw error;
+                            console.log(`[Sync] Deletado: ${item.tableName}/${item.itemId}`);
+                        }
+                        
+                        // If successful, remove from queue
+                        await db.syncQueue.delete(item.id);
+                        
+                    } catch (error) {
+                        console.error(`[Sync] Erro crítico no item ${item.id}:`, error);
+                        
+                        // Increment retries or fail
+                        if (item.retries >= 5) {
+                            await db.syncQueue.update(item.id, { status: 'failed', error: error.message });
+                        } else {
+                            await db.syncQueue.update(item.id, { 
+                                status: 'pending', 
+                                retries: (item.retries || 0) + 1 
+                            });
+                        }
                     }
                 }
+            } finally {
+                isSyncing = false;
             }
         }
         
@@ -956,7 +962,8 @@
                 
                 const { data: { session } } = await supabaseClient.auth.getSession();
                 if (navigator.onLine && session) {
-                    await processSyncQueue();
+                    // Sincronização em background para não travar a UI
+                    processSyncQueue().catch(e => console.error('[Sync] Erro no background:', e));
                 }
             } catch (error) {
                 console.error('Erro ao adicionar à fila de sincronização:', error);
@@ -1209,7 +1216,9 @@
             locationErrorTimeout: null,
             locationErrors: 0,
             autoFollow: true,
-            isFirstUpdate: true
+            isFirstUpdate: true,
+            offRouteCounter: 0, // Contador para detecção de desvio
+            lastRecalculationTime: 0 // Evitar recálculos seguidos
         };
         
         // Initialize database with sample data if empty
@@ -1919,111 +1928,58 @@
                 }
             }
             
-            showLoading(`Carregando ${getViewTitle(viewName)}...`);
-            
-            // Store current view in history if not replacing
+            // Navegação instantânea
             if (!options.replace && AppState.currentView) {
                 AppState.viewHistory.push(AppState.currentView);
             }
             
-            // Store previous view for transitions
             AppState.previousView = AppState.currentView;
             AppState.currentView = viewName;
-            
-            // Update active navigation item
             AppState.updateActiveNavItem();
             
-            // Small delay to ensure loading is shown
-            setTimeout(async () => {
+            (async () => {
                 try {
                     const appView = document.getElementById('app-view');
-                    
-                    // Store any parameters in dataset
                     if (options.params) {
                         Object.keys(options.params).forEach(key => {
                             appView.dataset[key] = options.params[key];
                         });
                     }
                     
-                    // Add slide animation class if transitioning
                     if (AppState.previousView && !options.noAnimation) {
                         appView.classList.add('fade-in');
-                        setTimeout(() => {
-                            appView.classList.remove('fade-in');
-                        }, 500);
+                        setTimeout(() => appView.classList.remove('fade-in'), 500);
                     }
                     
-                    // Clear current view
                     appView.innerHTML = '';
                     
-                    // Render the requested view
                     switch(viewName) {
-                        case 'welcome':
-                            await renderWelcomeView();
-                            break;
-                        case 'dashboard':
-                            await renderDashboardView();
-                            break;
-                        case 'harvest-fronts':
-                            await renderHarvestFrontsView();
-                            break;
-                        case 'add-harvest-front':
-                            await renderAddHarvestFrontView();
-                            break;
-                        case 'edit-harvest-front':
-                            await renderEditHarvestFrontView(appView.dataset.frontId);
-                            break;
-                        case 'routes':
-                            await renderRoutesView();
-                            break;
-                        case 'farms':
-                            await renderFarmsView();
-                            break;
-                        case 'add-farm':
-                            await renderAddFarmView();
-                            break;
-                        case 'record-route':
-                            await renderRecordRouteView(appView.dataset.frontId);
-                            break;
-                        case 'route-details':
-                            await renderRouteDetailsView(appView.dataset.frontId, appView.dataset.routeId);
-                            break;
-                        case 'driver':
-                            await renderDriverView();
-                            break;
-                        case 'drivers':
-                            await renderDriversView();
-                            break;
-                        case 'add-driver':
-                            await renderAddDriverView();
-                            break;
-                        case 'edit-driver':
-                            await renderEditDriverView(appView.dataset.driverId);
-                            break;
-                        case 'reports':
-                            await renderReportsView();
-                            break;
+                        case 'welcome': await renderWelcomeView(); break;
+                        case 'dashboard': await renderDashboardView(); break;
+                        case 'harvest-fronts': await renderHarvestFrontsView(); break;
+                        case 'add-harvest-front': await renderAddHarvestFrontView(); break;
+                        case 'edit-harvest-front': await renderEditHarvestFrontView(appView.dataset.frontId); break;
+                        case 'routes': await renderRoutesView(); break;
+                        case 'farms': await renderFarmsView(); break;
+                        case 'add-farm': await renderAddFarmView(); break;
+                        case 'record-route': await renderRecordRouteView(appView.dataset.frontId); break;
+                        case 'route-details': await renderRouteDetailsView(appView.dataset.frontId, appView.dataset.routeId); break;
+                        case 'driver': await renderDriverView(); break;
+                        case 'drivers': await renderDriversView(); break;
+                        case 'add-driver': await renderAddDriverView(); break;
+                        case 'edit-driver': await renderEditDriverView(appView.dataset.driverId); break;
+                        case 'reports': await renderReportsView(); break;
                         default:
                             await renderDashboardView();
                             AppState.currentView = 'dashboard';
                     }
-                    
-                    hideLoading();
-                    
-                    // Scroll to top of view
                     window.scrollTo(0, 0);
-                    
                 } catch (error) {
                     console.error(`Erro ao renderizar view '${viewName}':`, error);
-                    showToast(`Erro ao carregar a página: ${error.message}`, 'error');
-                    hideLoading();
-                    
-                    // Fallback to dashboard on error
-                    if (viewName !== 'dashboard') {
-                        showView('dashboard', { replace: true });
-                    }
+                    showToast(`Erro ao carregar página.`, 'error');
+                    if (viewName !== 'dashboard') showView('dashboard', { replace: true });
                 }
-            }, 100);
+            })();
         }
         
         function goBack() {
@@ -3212,15 +3168,20 @@
             try {
                 showLoading('Carregando detalhes da frente...');
                 
-                const front = await db.harvestFronts.get(parseInt(frontId));
+                const fId = frontId ? parseInt(frontId) : null;
+                if (fId === null || isNaN(fId)) {
+                    throw new Error("ID da frente inválido");
+                }
+                
+                const front = await db.harvestFronts.get(fId);
                 if (!front) {
                     hideLoading();
                     showToast('Frente de colheita não encontrada', 'error');
                     return;
                 }
                 
-                const routes = await db.routes.where('frontId').equals(frontId).toArray();
-                const drivers = await db.drivers.where('assignedFront').equals(frontId).toArray();
+                const routes = await db.routes.where('frontId').equals(fId).toArray();
+                const drivers = await db.drivers.where('assignedFront').equals(fId).toArray();
                 
                 // Process route paths for any that might be compressed
                 routes.forEach(route => {
@@ -3530,7 +3491,11 @@
         
         async function renderEditHarvestFrontView(frontId) {
             try {
-                const front = await db.harvestFronts.get(parseInt(frontId));
+                const fId = frontId ? parseInt(frontId) : null;
+                if (fId === null || isNaN(fId)) {
+                    throw new Error("ID da frente inválido");
+                }
+                const front = await db.harvestFronts.get(fId);
                 if (!front) {
                     showToast('Frente de colheita não encontrada', 'error');
                     showView('harvest-fronts');
@@ -4099,7 +4064,11 @@
         
         async function renderRecordRouteView(frontId) {
             try {
-                const front = await db.harvestFronts.get(parseInt(frontId));
+                const fId = frontId ? parseInt(frontId) : null;
+                if (fId === null || isNaN(fId)) {
+                    throw new Error("ID da frente inválido");
+                }
+                const front = await db.harvestFronts.get(fId);
                 if (!front) {
                     showToast('Frente de colheita não encontrada', 'error');
                     showView('harvest-fronts');
@@ -4282,7 +4251,7 @@
                 initRecordMap();
                 
                 const suggestedRouteId = appView.dataset.suggestedRouteId;
-                if (suggestedRouteId) {
+                if (suggestedRouteId && !isNaN(parseInt(suggestedRouteId))) {
                     db.routes.get(parseInt(suggestedRouteId)).then(async route => {
                         if (route && route.path && currentRecording.map) {
                             
@@ -4297,29 +4266,33 @@
                                 }
                                 
                                 if (dist > 5) { // If > 5km from Usina start
-                                    showToast('Recalculando rota a partir da sua localização...', 'info');
-                                    const routeEnd = route.path[route.path.length - 1];
-                                    const url = `https://router.project-osrm.org/route/v1/driving/${userPos.lng},${userPos.lat};${routeEnd.lng},${routeEnd.lat}?overview=full&geometries=geojson`;
-                                    
-                                    try {
-                                        const response = await fetch(url);
-                                        const data = await response.json();
-                                        if (data.routes && data.routes.length > 0) {
-                                            const newRoute = data.routes[0];
-                                            const newCoordinates = newRoute.geometry.coordinates.map(c => [c[1], c[0]]);
-                                            
-                                            currentRecording.suggestedRouteLayer = L.polyline(newCoordinates, {
-                                                color: '#3b82f6',
-                                                weight: 5,
-                                                opacity: 0.8,
-                                                dashArray: '10, 10'
-                                            }).addTo(currentRecording.map);
-                                            
-                                            const bounds = currentRecording.suggestedRouteLayer.getBounds();
-                                            if (bounds.isValid()) currentRecording.map.fitBounds(bounds);
-                                            return;
-                                        }
-                                    } catch(e) { console.error('Falha ao recalcular', e); }
+                                    if (navigator.onLine) {
+                                        showToast('Recalculando rota a partir da sua localização...', 'info');
+                                        const routeEnd = route.path[route.path.length - 1];
+                                        const url = `https://router.project-osrm.org/route/v1/driving/${userPos.lng},${userPos.lat};${routeEnd.lng},${routeEnd.lat}?overview=full&geometries=geojson`;
+                                        
+                                        try {
+                                            const response = await fetch(url);
+                                            const data = await response.json();
+                                            if (data.routes && data.routes.length > 0) {
+                                                const newRoute = data.routes[0];
+                                                const newCoordinates = newRoute.geometry.coordinates.map(c => [c[1], c[0]]);
+                                                
+                                                currentRecording.suggestedRouteLayer = L.polyline(newCoordinates, {
+                                                    color: '#3b82f6',
+                                                    weight: 5,
+                                                    opacity: 0.8,
+                                                    dashArray: '10, 10'
+                                                }).addTo(currentRecording.map);
+                                                
+                                                const bounds = currentRecording.suggestedRouteLayer.getBounds();
+                                                if (bounds.isValid()) currentRecording.map.fitBounds(bounds);
+                                                return;
+                                            }
+                                        } catch(e) { console.error('Falha ao recalcular', e); }
+                                    } else {
+                                        showToast('Você está longe do início da rota, mas está offline para recalcular.', 'warning');
+                                    }
                                 }
                             }
 
@@ -4464,7 +4437,12 @@
                     }
                 }
                 
-                const route = await db.routes.get(parseInt(routeId));
+                const rId = routeId ? parseInt(routeId) : null;
+                if (rId === null || isNaN(rId)) {
+                    throw new Error("ID da rota inválido");
+                }
+                
+                const route = await db.routes.get(rId);
                 if (!route) {
                     showToast('Rota não encontrada', 'error');
                     showView('routes');
@@ -4881,7 +4859,11 @@
         
         async function completeRoute(routeId) {
             try {
-                const route = await db.routes.get(parseInt(routeId));
+                const rId = routeId ? parseInt(routeId) : null;
+                if (rId === null || isNaN(rId)) {
+                    throw new Error("ID da rota inválido");
+                }
+                const route = await db.routes.get(rId);
                 if (!route) {
                     showToast('Rota não encontrada', 'error');
                     return;
@@ -4933,7 +4915,11 @@
         
         async function duplicateRoute(routeId) {
             try {
-                const route = await db.routes.get(parseInt(routeId));
+                const rId = routeId ? parseInt(routeId) : null;
+                if (rId === null || isNaN(rId)) {
+                    throw new Error("ID da rota inválido");
+                }
+                const route = await db.routes.get(rId);
                 if (!route) {
                     showToast('Rota não encontrada', 'error');
                     return;
@@ -5221,14 +5207,21 @@
         
         async function showDriverNavigation(frontId, routeId) {
             try {
-                const front = await db.harvestFronts.get(parseInt(frontId));
-                if (!front) {
-                    showToast('Frente de colheita não encontrada', 'error');
-                    showView('driver');
-                    return;
+                // Validate IDs to avoid DataError (NaN)
+                const fId = frontId ? parseInt(frontId) : null;
+                const rId = routeId ? parseInt(routeId) : null;
+                
+                if (rId === null || isNaN(rId)) {
+                    throw new Error("ID da rota inválido");
                 }
                 
-                const route = await db.routes.get(parseInt(routeId));
+                // Front ID might be null for suggested routes
+                let front = null;
+                if (fId !== null && !isNaN(fId)) {
+                    front = await db.harvestFronts.get(fId);
+                }
+                
+                const route = await db.routes.get(rId);
                 if (!route) {
                     showToast('Rota não encontrada', 'error');
                     showView('driver');
@@ -5522,44 +5515,50 @@
                         const distToUsina = haversineDistance(userLat, userLng, USINA_CAMBUI_LOCATION.lat, USINA_CAMBUI_LOCATION.lng);
                         
                         // Se estiver a mais de 500 metros da usina, recalcula a rota
-                        if (distToUsina > 0.5) {
+                        if (distToUsina > 0.5 && navigator.onLine) {
                             showLoading('Recalculando rota da sua posição atual...');
                             
                             const destination = navigationState.route.path[navigationState.route.path.length - 1];
                             const url = `https://router.project-osrm.org/route/v1/driving/${userLng},${userLat};${destination.lng},${destination.lat}?overview=full&geometries=geojson`;
                             
-                            const response = await fetch(url);
-                            const data = await response.json();
-                            
-                            if (data.routes && data.routes.length > 0) {
-                                const newPath = data.routes[0].geometry.coordinates.map(c => ({
-                                    lat: c[1],
-                                    lng: c[0],
-                                    timestamp: Date.now()
-                                }));
+                            try {
+                                const response = await fetch(url);
+                                const data = await response.json();
                                 
-                                // Atualiza a rota no estado
-                                navigationState.route.path = newPath;
-                                navigationState.route.distance = data.routes[0].distance / 1000;
-                                
-                                // Atualiza a polyline no mapa
-                                const latLngs = newPath.map(p => [p.lat, p.lng]);
-                                if (navigationState.routePolyline) {
-                                    navigationState.routePolyline.setLatLngs(latLngs);
+                                if (data.routes && data.routes.length > 0) {
+                                    const newPath = data.routes[0].geometry.coordinates.map(c => ({
+                                        lat: c[1],
+                                        lng: c[0],
+                                        timestamp: Date.now()
+                                    }));
+                                    
+                                    // Atualiza a rota no estado
+                                    navigationState.route.path = newPath;
+                                    navigationState.route.distance = data.routes[0].distance / 1000;
+                                    
+                                    // Atualiza a polyline no mapa
+                                    const latLngs = newPath.map(p => [p.lat, p.lng]);
+                                    if (navigationState.routePolyline) {
+                                        navigationState.routePolyline.setLatLngs(latLngs);
+                                    }
+                                    
+                                    // Atualiza o marcador de início
+                                    if (navigationState.startMarker) {
+                                        navigationState.startMarker.setLatLng([newPath[0].lat, newPath[0].lng]);
+                                    }
+                                    
+                                    // Ajusta o mapa para a nova rota
+                                    if (navigationState.map) {
+                                        navigationState.map.fitBounds(latLngs, { padding: [50, 50] });
+                                    }
+                                    
+                                    showToast('Rota recalculada a partir do seu local atual.', 'info');
                                 }
-                                
-                                // Atualiza o marcador de início
-                                if (navigationState.startMarker) {
-                                    navigationState.startMarker.setLatLng([newPath[0].lat, newPath[0].lng]);
-                                }
-                                
-                                // Ajusta o mapa para a nova rota
-                                if (navigationState.map) {
-                                    navigationState.map.fitBounds(latLngs, { padding: [50, 50] });
-                                }
-                                
-                                showToast('Rota recalculada a partir do seu local atual.', 'info');
+                            } catch (e) {
+                                console.error('Erro ao recalcular rota inicial:', e);
                             }
+                        } else if (distToUsina > 0.5 && !navigator.onLine) {
+                            showToast('Você está fora da usina, mas está offline para recalcular a rota.', 'warning');
                         }
                     } catch (geoErr) {
                         console.warn('Erro ao verificar posição inicial:', geoErr);
@@ -5689,6 +5688,33 @@
                 // Calculate closest point on route
                 const routePath = navigationState.route.path;
                 const closest = findClosestPointOnRoute(routePath, { lat, lng });
+                
+                // ==========================================
+                // DETECÇÃO DE DESVIO DE ROTA (REROUTING)
+                // ==========================================
+                // Se a distância for maior que 150 metros e o motorista estiver se movendo
+                if (closest.distance > 150 && speed > 5) {
+                    navigationState.offRouteCounter++;
+                    
+                    // Se desviar por 3 atualizações consecutivas (~15-20 segundos)
+                    if (navigationState.offRouteCounter >= 3) {
+                        const now = Date.now();
+                        // Evita recálculos repetitivos (mínimo 30 segundos entre recálculos)
+                        if (now - navigationState.lastRecalculationTime > 30000) {
+                            navigationState.offRouteCounter = 0;
+                            navigationState.lastRecalculationTime = now;
+                            
+                            if (navigator.onLine) {
+                                recalculateNavigationRoute(lat, lng);
+                            } else {
+                                console.warn('[Nav] Fora de rota, mas sem internet para recalcular.');
+                                showNavigationAlert('Fora de Rota', 'Você saiu do caminho sugerido. Sem internet para recalcular.', 'warning');
+                            }
+                        }
+                    }
+                } else {
+                    navigationState.offRouteCounter = 0;
+                }
                 
                 // Update navigation stats
                 updateNavigationStats(closest, speed);
@@ -5848,6 +5874,52 @@
                     showNavigationAlert(`Ponto ${waypointNumber} Alcançado`, 'Continue seguindo a rota para o próximo ponto.');
                 }
             });
+        }
+        
+        async function recalculateNavigationRoute(lat, lng) {
+            try {
+                console.log(`[Nav] Recalculando rota a partir de: ${lat}, ${lng}`);
+                
+                // O destino é sempre o último ponto da rota atual (destino final)
+                const destination = navigationState.route.path[navigationState.route.path.length - 1];
+                const url = `https://router.project-osrm.org/route/v1/driving/${lng},${lat};${destination.lng},${destination.lat}?overview=full&geometries=geojson`;
+                
+                const response = await fetch(url);
+                if (!response.ok) throw new Error('Falha na rede ao acessar OSRM');
+                
+                const data = await response.json();
+                
+                if (data.routes && data.routes.length > 0) {
+                    const newPath = data.routes[0].geometry.coordinates.map(c => ({
+                        lat: c[1],
+                        lng: c[0],
+                        timestamp: Date.now()
+                    }));
+                    
+                    // Atualiza a rota no estado
+                    navigationState.route.path = newPath;
+                    navigationState.route.distance = data.routes[0].distance / 1000;
+                    
+                    // Atualiza a polyline no mapa
+                    const latLngs = newPath.map(p => [p.lat, p.lng]);
+                    if (navigationState.routePolyline) {
+                        navigationState.routePolyline.setLatLngs(latLngs);
+                        // Efeito visual de recálculo (pisca a linha)
+                        navigationState.routePolyline.setStyle({ color: '#fbbf24' }); 
+                        setTimeout(() => {
+                            if (navigationState.routePolyline) {
+                                navigationState.routePolyline.setStyle({ color: '#3b82f6' }); 
+                            }
+                        }, 2000);
+                    }
+                    
+                    showNavigationAlert('Rota Recalculada', 'Você saiu do caminho e uma nova rota foi traçada.');
+                    console.log('[Nav] Rota recalculada com sucesso.');
+                }
+            } catch (error) {
+                console.error('[Nav] Erro ao recalcular rota:', error);
+                showToast('Erro ao recalcular rota. Verifique sua conexão.', 'error');
+            }
         }
         
         function showNavigationAlert(title, message) {
@@ -6537,7 +6609,11 @@
         
         async function renderEditDriverView(driverId) {
             try {
-                const driver = await db.drivers.get(parseInt(driverId));
+                const dId = driverId ? parseInt(driverId) : null;
+                if (dId === null || isNaN(dId)) {
+                    throw new Error("ID do motorista inválido");
+                }
+                const driver = await db.drivers.get(dId);
                 if (!driver) {
                     showToast('Motorista não encontrado', 'error');
                     showView('drivers');
@@ -7367,8 +7443,7 @@
             event.preventDefault();
             
             try {
-                showLoading('Salvando frente de colheita...');
-                
+                // Remove showLoading para evitar travamento visual
                 const name = document.getElementById('frontName').value;
                 const description = document.getElementById('frontDescription').value;
                 const location = document.getElementById('frontLocation').value;
@@ -7376,7 +7451,7 @@
                 const statusRadios = document.getElementsByName('frontStatus');
                 
                 // Get selected color
-                let color = '#2ecc71'; // Default color
+                let color = '#2ecc71'; 
                 for (const radio of colorRadios) {
                     if (radio.checked) {
                         color = radio.value;
@@ -7385,7 +7460,7 @@
                 }
                 
                 // Get selected status
-                let status = 'active'; // Default status
+                let status = 'active'; 
                 for (const radio of statusRadios) {
                     if (radio.checked) {
                         status = radio.value;
@@ -7405,41 +7480,39 @@
                     updatedAt: new Date().toISOString()
                 };
                 
-                // Add to database
+                // Add to database local (instantâneo)
                 await db.harvestFronts.add(newFront);
                 
-                // === Vincular Rotas Sugeridas Automaticamente ===
-                try {
-                    const expectedRouteName = `Rota Sugerida - ${location}`;
-                    const suggestedRoutes = await db.routes
-                        .filter(r => (r.name === expectedRouteName || (r.tags && r.tags.includes('sugerida') && r.name.includes(location))) && (!r.frontId))
-                        .toArray();
-                    
-                    if (suggestedRoutes.length > 0) {
-                        for (const route of suggestedRoutes) {
-                            await db.routes.update(route.id, { frontId: id });
-                            // Fetch updated route to sync FULL object, preventing data loss
-                            const updatedRoute = await db.routes.get(route.id);
-                            await addToSyncQueue('update', 'routes', route.id, updatedRoute);
+                // Vincular rotas sugeridas em background
+                (async () => {
+                    try {
+                        const expectedRouteName = `Rota Sugerida - ${location}`;
+                        const suggestedRoutes = await db.routes
+                            .filter(r => (r.name === expectedRouteName || (r.tags && r.tags.includes('sugerida') && r.name.includes(location))) && (!r.frontId))
+                            .toArray();
+                        
+                        if (suggestedRoutes.length > 0) {
+                            for (const route of suggestedRoutes) {
+                                await db.routes.update(route.id, { frontId: id });
+                                const updatedRoute = await db.routes.get(route.id);
+                                await addToSyncQueue('update', 'routes', route.id, updatedRoute);
+                            }
+                            showToast(`${suggestedRoutes.length} rota(s) sugerida(s) vinculada(s).`, 'info');
                         }
-                        showToast(`${suggestedRoutes.length} rota(s) sugerida(s) vinculada(s).`, 'info');
+                    } catch (e) {
+                        console.error('Erro ao vincular rotas sugeridas:', e);
                     }
-                } catch (e) {
-                    console.error('Erro ao vincular rotas sugeridas:', e);
-                }
+                })();
                 
-                await addToSyncQueue('add', 'harvestFronts', id, { ...newFront, id });
+                // Adicionar à fila de sincronização (não aguarda o Supabase aqui)
+                addToSyncQueue('add', 'harvestFronts', id, { ...newFront, id });
                 
-                hideLoading();
                 showToast('Frente de colheita adicionada com sucesso!', 'success');
-                
-                // Navigate to harvest fronts view
                 showView('harvest-fronts');
                 
             } catch (error) {
                 console.error('Erro ao salvar frente de colheita:', error);
-                hideLoading();
-                showToast('Erro ao salvar frente de colheita: ' + error.message, 'error');
+                showToast('Erro ao salvar: ' + error.message, 'error');
             }
         }
         
@@ -7447,7 +7520,10 @@
             event.preventDefault();
             
             try {
-                showLoading('Atualizando frente de colheita...');
+                const fId = frontId ? parseInt(frontId) : null;
+                if (fId === null || isNaN(fId)) {
+                    throw new Error("ID da frente inválido");
+                }
                 
                 const name = document.getElementById('frontName').value;
                 const description = document.getElementById('frontDescription').value;
@@ -7456,7 +7532,7 @@
                 const statusRadios = document.getElementsByName('frontStatus');
                 
                 // Get selected color
-                let color = '#2ecc71'; // Default color
+                let color = '#2ecc71'; 
                 for (const radio of colorRadios) {
                     if (radio.checked) {
                         color = radio.value;
@@ -7465,7 +7541,7 @@
                 }
                 
                 // Get selected status
-                let status = 'active'; // Default status
+                let status = 'active'; 
                 for (const radio of statusRadios) {
                     if (radio.checked) {
                         status = radio.value;
@@ -7476,14 +7552,11 @@
                 // Check if status is being changed to inactive
                 if (status === 'inactive') {
                     // Get original front to check original status
-                    const originalFront = await db.harvestFronts.get(frontId);
+                    const originalFront = await db.harvestFronts.get(fId);
                     
                     if (originalFront && originalFront.status === 'active') {
                         // Check if there are any active drivers assigned to this front
-                        const assignedDrivers = await db.drivers.where({
-                            assignedFront: frontId,
-                            status: 'active'
-                        }).count();
+                        const assignedDrivers = await db.drivers.where('assignedFront').equals(fId).and(d => d.status === 'active').count();
                         
                         if (assignedDrivers > 0) {
                             showConfirmModal(
@@ -7491,22 +7564,20 @@
                                 `Esta frente possui ${assignedDrivers} motorista(s) ativo(s) atribuído(s). Deseja continuar e inativar a frente mesmo assim?`,
                                 async () => {
                                     // Continue with the update
-                                    await completeHarvestFrontUpdate(frontId, name, description, location, color, status);
+                                    await completeHarvestFrontUpdate(fId, name, description, location, color, status);
                                 }
                             );
-                            hideLoading();
                             return;
                         }
                     }
                 }
                 
                 // No confirmation needed, proceed with update
-                await completeHarvestFrontUpdate(frontId, name, description, location, color, status);
+                await completeHarvestFrontUpdate(fId, name, description, location, color, status);
                 
             } catch (error) {
                 console.error('Erro ao atualizar frente de colheita:', error);
-                hideLoading();
-                showToast('Erro ao atualizar frente de colheita: ' + error.message, 'error');
+                showToast('Erro ao atualizar: ' + error.message, 'error');
             }
         }
         
@@ -7521,22 +7592,21 @@
                     updatedAt: new Date().toISOString()
                 };
                 
-                // Update in database
+                // Update in database local (instantâneo)
                 await db.harvestFronts.update(frontId, updates);
                 
-                const fullFront = await db.harvestFronts.get(frontId);
-                await addToSyncQueue('update', 'harvestFronts', frontId, fullFront);
+                // Sincronização em background
+                (async () => {
+                    const fullFront = await db.harvestFronts.get(frontId);
+                    addToSyncQueue('update', 'harvestFronts', frontId, fullFront);
+                })();
                 
-                hideLoading();
                 showToast('Frente de colheita atualizada com sucesso!', 'success');
-                
-                // Navigate to harvest fronts view
                 showView('harvest-fronts');
                 
             } catch (error) {
                 console.error('Erro ao concluir atualização da frente:', error);
-                hideLoading();
-                showToast('Erro ao atualizar frente de colheita: ' + error.message, 'error');
+                showToast('Erro ao atualizar banco de dados.', 'error');
             }
         }
         
@@ -7580,31 +7650,27 @@
                 'Tem certeza que deseja excluir esta frente de colheita? Esta ação não pode ser desfeita.',
                 async () => {
                     try {
-                        showLoading('Excluindo frente...');
+                        const fId = frontId ? parseInt(frontId) : null;
+                        if (fId === null || isNaN(fId)) {
+                            throw new Error("ID da frente inválido");
+                        }
                         
                         // Check if there are any routes associated with this front
-                        const routesCount = await db.routes.where('frontId').equals(frontId).count();
+                        const routesCount = await db.routes.where('frontId').equals(fId).count();
                         
                         if (routesCount > 0) {
-                            hideLoading();
                             showConfirmModal(
                                 'Rotas Associadas',
                                 `Esta frente possui ${routesCount} rota(s) associada(s). Excluir a frente também excluirá todas estas rotas. Deseja continuar?`,
                                 async () => {
-                                    showLoading('Excluindo frente e rotas associadas...');
+                                    // Deletar tudo localmente (instantâneo)
+                                    await db.routes.where('frontId').equals(fId).delete();
+                                    await db.harvestFronts.delete(fId);
                                     
-                                    // Delete all associated routes
-                                    await db.routes.where('frontId').equals(frontId).delete();
+                                    // Sincronização em background
+                                    addToSyncQueue('delete', 'harvestFronts', fId, { id: fId });
                                     
-                                    // Delete the front
-                                    await db.harvestFronts.delete(frontId);
-                                    
-                                    await addToSyncQueue('delete', 'harvestFronts', frontId, { id: frontId });
-                                    
-                                    hideLoading();
-                                    showToast('Frente de colheita e rotas associadas excluídas com sucesso!', 'success');
-                                    
-                                    // Refresh the current view
+                                    showToast('Frente e rotas excluídas!', 'success');
                                     showView('harvest-fronts', { replace: true });
                                 },
                                 'Excluir Tudo',
@@ -7614,21 +7680,18 @@
                             return;
                         }
                         
-                        // No routes associated, just delete the front
-                        await db.harvestFronts.delete(frontId);
+                        // Deletar localmente
+                        await db.harvestFronts.delete(fId);
                         
-                        await addToSyncQueue('delete', 'harvestFronts', frontId, { id: frontId });
+                        // Sync background
+                        addToSyncQueue('delete', 'harvestFronts', fId, { id: fId });
                         
-                        hideLoading();
-                        showToast('Frente de colheita excluída com sucesso!', 'success');
-                        
-                        // Refresh the current view
+                        showToast('Frente excluída com sucesso!', 'success');
                         showView('harvest-fronts', { replace: true });
                         
                     } catch (error) {
                         console.error('Erro ao excluir frente de colheita:', error);
-                        hideLoading();
-                        showToast('Erro ao excluir frente de colheita: ' + error.message, 'error');
+                        showToast('Erro ao excluir: ' + error.message, 'error');
                     }
                 },
                 'Excluir',
@@ -7711,22 +7774,23 @@
                 'Tem certeza que deseja excluir esta rota? Esta ação não pode ser desfeita.',
                 async () => {
                     try {
-                        showLoading('Excluindo rota...');
+                        const rId = routeId ? parseInt(routeId) : null;
+                        if (rId === null || isNaN(rId)) {
+                            throw new Error("ID da rota inválido");
+                        }
                         
-                        await db.routes.delete(routeId);
+                        // Deletar localmente
+                        await db.routes.delete(rId);
                         
-                        await addToSyncQueue('delete', 'routes', routeId, { id: routeId });
+                        // Sync background
+                        addToSyncQueue('delete', 'routes', rId, { id: rId });
                         
-                        hideLoading();
                         showToast('Rota excluída com sucesso!', 'success');
-                        
-                        // Go back to routes view
                         showView('routes');
                         
                     } catch (error) {
                         console.error('Erro ao excluir rota:', error);
-                        hideLoading();
-                        showToast('Erro ao excluir rota: ' + error.message, 'error');
+                        showToast('Erro ao excluir: ' + error.message, 'error');
                     }
                 },
                 'Excluir',
@@ -7739,8 +7803,6 @@
             event.preventDefault();
             
             try {
-                showLoading('Salvando motorista...');
-                
                 const name = document.getElementById('driverName').value;
                 const phone = document.getElementById('driverPhone').value;
                 const license = document.getElementById('driverLicense').value;
@@ -7751,7 +7813,7 @@
                 const statusRadios = document.getElementsByName('driverStatus');
                 
                 // Get selected status
-                let status = 'active'; // Default status
+                let status = 'active'; 
                 for (const radio of statusRadios) {
                     if (radio.checked) {
                         status = radio.value;
@@ -7774,21 +7836,18 @@
                     updatedAt: new Date().toISOString()
                 };
                 
-                // Add to database
+                // Add to database local
                 await db.drivers.add(newDriver);
                 
-                await addToSyncQueue('add', 'drivers', id, { ...newDriver, id });
+                // Sync background
+                addToSyncQueue('add', 'drivers', id, { ...newDriver, id });
                 
-                hideLoading();
                 showToast('Motorista adicionado com sucesso!', 'success');
-                
-                // Navigate to drivers view
                 showView('drivers');
                 
             } catch (error) {
                 console.error('Erro ao salvar motorista:', error);
-                hideLoading();
-                showToast('Erro ao salvar motorista: ' + error.message, 'error');
+                showToast('Erro ao salvar: ' + error.message, 'error');
             }
         }
         
@@ -7828,22 +7887,21 @@
                     updatedAt: new Date().toISOString()
                 };
                 
-                // Update in database
+                // Update in database local
                 await db.drivers.update(driverId, updates);
                 
-                const fullDriver = await db.drivers.get(driverId);
-                await addToSyncQueue('update', 'drivers', driverId, fullDriver);
+                // Sync background
+                (async () => {
+                    const fullDriver = await db.drivers.get(driverId);
+                    addToSyncQueue('update', 'drivers', driverId, fullDriver);
+                })();
                 
-                hideLoading();
-                showToast('Motorista atualizado com sucesso!', 'success');
-                
-                // Navigate to drivers view
+                showToast('Motorista atualizado!', 'success');
                 showView('drivers');
                 
             } catch (error) {
                 console.error('Erro ao atualizar motorista:', error);
-                hideLoading();
-                showToast('Erro ao atualizar motorista: ' + error.message, 'error');
+                showToast('Erro ao atualizar: ' + error.message, 'error');
             }
         }
         
@@ -7860,8 +7918,6 @@
                 newStatus === 'active' ? 'Tem certeza que deseja ativar este motorista?' : 'Tem certeza que deseja desativar este motorista?',
                 async () => {
                     try {
-                        showLoading('Atualizando status...');
-                        
                         const updates = {
                             status: newStatus,
                             updatedAt: new Date().toISOString()
@@ -7869,19 +7925,18 @@
                         
                         await db.drivers.update(driverId, updates);
                         
-                        const fullDriver = await db.drivers.get(driverId);
-                        await addToSyncQueue('update', 'drivers', driverId, fullDriver);
+                        // Background sync
+                        (async () => {
+                            const fullDriver = await db.drivers.get(driverId);
+                            addToSyncQueue('update', 'drivers', driverId, fullDriver);
+                        })();
                         
-                        hideLoading();
-                        showToast(`Motorista ${newStatus === 'active' ? 'ativado' : 'desativado'} com sucesso!`, 'success');
-                        
-                        // Refresh the current view
+                        showToast(`Motorista ${newStatus === 'active' ? 'ativado' : 'desativado'}!`, 'success');
                         showView('drivers', { replace: true });
                         
                     } catch (error) {
                         console.error('Erro ao atualizar status do motorista:', error);
-                        hideLoading();
-                        showToast('Erro ao atualizar status do motorista: ' + error.message, 'error');
+                        showToast('Erro ao atualizar: ' + error.message, 'error');
                     }
                 }
             );
@@ -7893,22 +7948,23 @@
                 'Tem certeza que deseja excluir este motorista? Esta ação não pode ser desfeita.',
                 async () => {
                     try {
-                        showLoading('Excluindo motorista...');
+                        const dId = driverId ? parseInt(driverId) : null;
+                        if (dId === null || isNaN(dId)) {
+                            throw new Error("ID do motorista inválido");
+                        }
                         
-                        await db.drivers.delete(driverId);
+                        // Local delete
+                        await db.drivers.delete(dId);
                         
-                        await addToSyncQueue('delete', 'drivers', driverId, { id: driverId });
+                        // Sync background
+                        addToSyncQueue('delete', 'drivers', dId, { id: dId });
                         
-                        hideLoading();
-                        showToast('Motorista excluído com sucesso!', 'success');
-                        
-                        // Refresh the current view
+                        showToast('Motorista excluído!', 'success');
                         showView('drivers', { replace: true });
                         
                     } catch (error) {
                         console.error('Erro ao excluir motorista:', error);
-                        hideLoading();
-                        showToast('Erro ao excluir motorista: ' + error.message, 'error');
+                        showToast('Erro ao excluir: ' + error.message, 'error');
                     }
                 },
                 'Excluir',
@@ -8292,8 +8348,6 @@
             }
             
             try {
-                showLoading('Salvando fazenda...');
-                
                 const id = generateNumericID();
                 const timestamps = {
                     createdAt: new Date().toISOString(),
@@ -8308,15 +8362,15 @@
                     ...timestamps
                 };
                 
+                // Salvar local imediato
                 await db.farms.add(farmData);
 
-                // Generate suggested route from KML/Location
-                if (currentFarmGeoJson) {
+                // Processamento de rota sugerida em background
+                (async () => {
                     try {
                         let routePath = [];
                         let hasRoute = false;
 
-                        // Try LineString
                         const lineStringFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'LineString');
                         if (lineStringFeature) {
                              routePath = lineStringFeature.geometry.coordinates.map(c => ({
@@ -8326,67 +8380,37 @@
                             }));
                             hasRoute = true;
                         } else {
-                            // Try Polygon, MultiPolygon or Point (Manual) -> Calculate route from Usina Cambuí
-                        let polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'Polygon');
-                        if (!polygonFeature) polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'MultiPolygon');
-                        if (!polygonFeature) polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'Point');
-                        
-                        if (polygonFeature) {
-                                // Coordenadas da Usina Cambuí (Fornecidas pelo usuário)
+                            let polygonFeature = currentFarmGeoJson.features.find(f => f.geometry.type === 'Polygon') ||
+                                             currentFarmGeoJson.features.find(f => f.geometry.type === 'MultiPolygon') ||
+                                             currentFarmGeoJson.features.find(f => f.geometry.type === 'Point');
+                            
+                            if (polygonFeature) {
                                 const USINA_CAMBUI_LOCATION = { lat: -17.924714302556936, lng: -50.63708775318097 };
-                                
-                                // Get farm center
                                 const layer = L.geoJSON(polygonFeature);
                                 const center = layer.getBounds().getCenter();
                                 
-                                // Fetch route from OSRM
-                                const url = `https://router.project-osrm.org/route/v1/driving/${USINA_CAMBUI_LOCATION.lng},${USINA_CAMBUI_LOCATION.lat};${center.lng},${center.lat}?overview=full&geometries=geojson`;
-                                
-                                try {
-                                    const response = await fetch(url);
-                                    const data = await response.json();
-                                    
-                                    if (data.routes && data.routes.length > 0) {
-                                        const route = data.routes[0];
-                                        routePath = route.geometry.coordinates.map(c => ({
-                                            lat: c[1],
-                                            lng: c[0],
-                                            timestamp: Date.now()
-                                        }));
-                                        hasRoute = true;
-                                    } else {
-                                        // Fallback to perimeter
-                                        let ring = [];
-                                        if (polygonFeature.geometry.type === 'Polygon') {
-                                            ring = polygonFeature.geometry.coordinates[0];
-                                        } else if (polygonFeature.geometry.type === 'MultiPolygon') {
-                                            ring = polygonFeature.geometry.coordinates[0][0];
-                                        }
-                                        
-                                        if (ring && ring.length > 0) {
-                                             routePath = ring.map(c => ({
+                                if (navigator.onLine) {
+                                    const url = `https://router.project-osrm.org/route/v1/driving/${USINA_CAMBUI_LOCATION.lng},${USINA_CAMBUI_LOCATION.lat};${center.lng},${center.lat}?overview=full&geometries=geojson`;
+                                    try {
+                                        const response = await fetch(url);
+                                        const data = await response.json();
+                                        if (data.routes && data.routes.length > 0) {
+                                            routePath = data.routes[0].geometry.coordinates.map(c => ({
                                                 lat: c[1],
                                                 lng: c[0],
                                                 timestamp: Date.now()
                                             }));
                                             hasRoute = true;
                                         }
-                                    }
-                                } catch (err) {
-                                    console.error('Erro ao calcular rota da Usina:', err);
-                                    let ring = [];
-                                    if (polygonFeature.geometry.type === 'Polygon') {
-                                        ring = polygonFeature.geometry.coordinates[0];
-                                    } else if (polygonFeature.geometry.type === 'MultiPolygon') {
-                                        ring = polygonFeature.geometry.coordinates[0][0];
-                                    }
-                                    
-                                    if (ring && ring.length > 0) {
-                                         routePath = ring.map(c => ({
-                                            lat: c[1],
-                                            lng: c[0],
-                                            timestamp: Date.now()
-                                        }));
+                                    } catch (err) { console.warn('Erro OSRM:', err); }
+                                }
+
+                                if (!hasRoute) {
+                                    // Fallback para perímetro se offline ou erro
+                                    let ring = polygonFeature.geometry.type === 'Polygon' ? polygonFeature.geometry.coordinates[0] :
+                                               (polygonFeature.geometry.type === 'MultiPolygon' ? polygonFeature.geometry.coordinates[0][0] : []);
+                                    if (ring.length > 0) {
+                                        routePath = ring.map(c => ({ lat: c[1], lng: c[0], timestamp: Date.now() }));
                                         hasRoute = true;
                                     }
                                 }
@@ -8401,18 +8425,14 @@
                                  }
                              }
 
-                             const tags = ['sugerida', 'kml', 'auto-generated'];
-                             if (distance > 5) tags.push('usina-to-farm');
-
                              const routeId = generateNumericID();
                              const suggestedRoute = {
                                 id: routeId,
                                 name: `Rota Sugerida - ${name}`,
-                                frontId: null, 
                                 farmId: id,
                                 startTime: new Date().toISOString(),
                                 status: 'active', 
-                                tags: tags,
+                                tags: ['sugerida', 'auto-generated', distance > 5 ? 'usina-to-farm' : 'kml'],
                                 path: routePath,
                                 distance: distance,
                                 createdAt: new Date().toISOString(),
@@ -8420,23 +8440,20 @@
                             };
                             
                             await db.routes.add(suggestedRoute);
-                            // Important: Sync the route immediately to Supabase
-                            await addToSyncQueue('add', 'routes', routeId, { ...suggestedRoute, id: routeId });
+                            addToSyncQueue('add', 'routes', routeId, { ...suggestedRoute, id: routeId });
+                            showToast(`Rota sugerida para ${name} pronta!`, 'info');
                         }
-                    } catch (e) {
-                        console.error('Erro ao gerar rota sugerida:', e);
-                    }
-                }
+                    } catch (e) { console.error('Erro rota sugerida:', e); }
+                })();
                 
-                await addToSyncQueue('add', 'farms', id, { ...farmData, id });
+                // Sync farm background
+                addToSyncQueue('add', 'farms', id, { ...farmData, id });
                 
-                hideLoading();
-                showToast('Fazenda cadastrada com sucesso!', 'success');
+                showToast('Fazenda cadastrada!', 'success');
                 showView('farms');
                 
             } catch (error) {
                 console.error('Erro ao salvar fazenda:', error);
-                hideLoading();
                 showToast('Erro ao salvar fazenda.', 'error');
             }
         }
@@ -8447,13 +8464,14 @@
                 'Tem certeza que deseja excluir esta fazenda e suas rotas sugeridas? Esta ação não pode ser desfeita.',
                 async () => {
                     try {
-                        showLoading('Excluindo...');
+                        const fId = id ? parseInt(id) : null;
+                        if (fId === null || isNaN(fId)) {
+                            throw new Error("ID da fazenda inválido");
+                        }
                         
-                        // Get farm details to find associated routes
-                        const farm = await db.farms.get(id);
-                        
+                        // Local deletion (instant)
+                        const farm = await db.farms.get(fId);
                         if (farm) {
-                            // Find associated suggested routes by name match
                             const allRoutes = await db.routes.toArray();
                             const routesToDelete = allRoutes.filter(r => 
                                 r.tags && 
@@ -8461,26 +8479,22 @@
                                 r.name === `Rota Sugerida - ${farm.name}`
                             );
                             
-                            // Delete associated routes
                             if (routesToDelete.length > 0) {
                                 for (const route of routesToDelete) {
                                     await db.routes.delete(route.id);
-                                    await addToSyncQueue('delete', 'routes', route.id, null);
+                                    addToSyncQueue('delete', 'routes', route.id, null);
                                 }
-                                console.log(`Deleted ${routesToDelete.length} suggested routes for farm ${farm.name}`);
                             }
                         }
                         
-                        await db.farms.delete(id);
-                        await addToSyncQueue('delete', 'farms', id, null);
+                        await db.farms.delete(fId);
+                        addToSyncQueue('delete', 'farms', fId, null);
                         
-                        hideLoading();
-                        showToast('Fazenda excluída com sucesso.', 'success');
-                        renderFarmsView(); // Refresh list
+                        showToast('Fazenda excluída!', 'success');
+                        renderFarmsView(); 
                         
                     } catch (error) {
                         console.error('Erro ao excluir fazenda:', error);
-                        hideLoading();
                         showToast('Erro ao excluir fazenda.', 'error');
                     }
                 },
@@ -9007,40 +9021,29 @@
                 'Tem certeza que deseja parar a gravação? Isso salvará a rota atual e finalizará o registro.',
                 async () => {
                     try {
-                        showLoading('Salvando rota...');
-                        
-                        // Stop recording
+                        // Iniciar processamento
                         currentRecording.recording = false;
                         currentRecording.paused = false;
                         currentRecording.endTime = new Date().toISOString();
                         
-                        // Stop location tracking
+                        // Parar GPS e Timer imediatamente
                         if (currentRecording.watchId) {
                             navigator.geolocation.clearWatch(currentRecording.watchId);
                             currentRecording.watchId = null;
                         }
-                        
-                        // Stop timer
                         clearInterval(currentRecording.timer);
-                        
-                        // Clear location error timeout
                         clearTimeout(currentRecording.locationErrorTimeout);
                         
-                        // Calculate final distance
-                        const distance = updateRouteDistance();
-                        
-                        // Calculate duration in minutes
+                        // Cálculo de distância e estatísticas
+                        const distance = updateRouteDistance() || 0;
                         const startTime = new Date(currentRecording.startTime);
                         const endTime = new Date(currentRecording.endTime);
                         const durationMinutes = (endTime - startTime) / (1000 * 60);
-                        
-                        // Calculate average speed
                         const averageSpeed = distance > 0 && durationMinutes > 0 ? distance / (durationMinutes / 60) : 0;
                         
-                        // Compress path data
+                        // Compressão (pode ser pesada, mas agora o GPS já parou)
                         const compressedPath = compressPathData(currentRecording.path);
                         
-                        // Create route object
                         const routeId = generateNumericID();
                         const newRoute = {
                             id: routeId,
@@ -9059,19 +9062,15 @@
                             updatedAt: new Date().toISOString()
                         };
                         
-                        // Save to database
+                        // Salvar local (rápido)
                         await db.routes.add(newRoute);
                         
-                        // Add to sync queue for Supabase
-                        await addToSyncQueue('add', 'routes', routeId, { ...newRoute, id: routeId });
+                        // Sync background (não bloqueia)
+                        addToSyncQueue('add', 'routes', routeId, { ...newRoute, id: routeId });
                         
-                        // Allow screen to sleep again
                         keepScreenOn(false);
-                        
-                        hideLoading();
                         showToast('Rota salva com sucesso!', 'success');
                         
-                        // Navigate to route details
                         showView('route-details', {
                             params: {
                                 frontId: currentRecording.frontId,
@@ -9081,10 +9080,8 @@
                         
                     } catch (error) {
                         console.error('Erro ao parar gravação:', error);
-                        hideLoading();
-                        showToast('Erro ao salvar rota: ' + error.message, 'error');
+                        showToast('Erro ao salvar: ' + error.message, 'error');
                         
-                        // Reset UI
                         document.getElementById('startButton').disabled = false;
                         document.getElementById('stopButton').disabled = true;
                         document.getElementById('pauseButton').disabled = true;
@@ -9463,7 +9460,11 @@
             
             setTimeout(async () => {
                 try {
-                    const route = await db.routes.get(parseInt(routeId));
+                    const rId = routeId ? parseInt(routeId) : null;
+                    if (rId === null || isNaN(rId)) {
+                        throw new Error("ID da rota inválido");
+                    }
+                    const route = await db.routes.get(rId);
                     if (!route) {
                         showToast('Rota não encontrada', 'error');
                         return;
@@ -9652,15 +9653,26 @@
             }
         }
         
+        // Global toast queue to prevent message overwriting
+        let toastQueue = [];
+        let isShowingToast = false;
+
         function showToast(message, type = 'info') {
+            toastQueue.push({ message, type });
+            processToastQueue();
+        }
+
+        function processToastQueue() {
+            if (isShowingToast || toastQueue.length === 0) return;
+            
+            isShowingToast = true;
+            const { message, type } = toastQueue.shift();
+            
             const toast = document.getElementById('toast');
             const toastMessage = document.getElementById('toast-message');
             
             if (toast && toastMessage) {
-                // Set message
                 toastMessage.textContent = message;
-                
-                // Set icon and color based on type
                 const iconElement = toast.querySelector('i.fas');
                 
                 toast.classList.remove('border-primary-500', 'border-green-500', 'border-yellow-500', 'border-red-500');
@@ -9684,7 +9696,7 @@
                             toast.classList.add('border-red-500');
                             iconElement.className = iconElement.className.replace('text-primary-500', 'text-red-500');
                             break;
-                        default: // info
+                        default:
                             iconElement.classList.add('fa-info-circle');
                             toast.classList.add('border-primary-500');
                             iconElement.className = iconElement.className.replace(/text-\w+-500/, 'text-primary-500');
@@ -9692,11 +9704,17 @@
                     }
                 }
                 
-                // Show toast
                 toast.classList.add('show');
                 
-                // Hide after 4 seconds
-                setTimeout(hideToast, 4000);
+                setTimeout(() => {
+                    hideToast();
+                    setTimeout(() => {
+                        isShowingToast = false;
+                        processToastQueue();
+                    }, 300); // Wait for transition
+                }, 3000);
+            } else {
+                isShowingToast = false;
             }
         }
         
