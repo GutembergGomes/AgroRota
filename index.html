@@ -1417,10 +1417,21 @@
                 showLoading('Conectando com Google (Supabase)...');
                 appLog(`Login Google via Supabase...`);
                 
+                // Determinando o URL de redirecionamento correto
+                // Se estiver no browser local (file://), o OAuth NÃO funcionará
+                let redirectTo = window.location.origin;
+                
+                if (!redirectTo || redirectTo === 'null' || redirectTo.startsWith('file://')) {
+                    // Fallback para localhost caso esteja testando localmente, mas
+                    // o usuário PRECISA rodar um servidor (ex: Live Server) para funcionar.
+                    redirectTo = 'http://localhost:5500'; // Porta padrão do Live Server
+                    console.warn('OAuth não funciona com protocolo file://. Use um servidor local (ex: Live Server).');
+                }
+
                 const { data, error } = await supabaseClient.auth.signInWithOAuth({
                     provider: 'google',
                     options: {
-                        redirectTo: window.location.origin
+                        redirectTo: redirectTo
                     }
                 });
                 
