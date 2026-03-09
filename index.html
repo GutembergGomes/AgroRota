@@ -898,8 +898,29 @@
                     console.warn('[Sync] Usuário não autenticado, adiando sincronização.');
                     return;
                 }
+
+                const totalItems = queueItems.length;
+                let processedCount = 0;
+                
+                // Show UI
+                const container = document.getElementById('sync-status-container');
+                const progressContainer = document.getElementById('sync-progress-container');
+                const progressBar = document.getElementById('sync-progress-bar');
+                const statusMsg = document.getElementById('sync-current-item');
+                
+                if (container && progressContainer) {
+                    container.classList.remove('hidden');
+                    progressContainer.classList.remove('hidden');
+                    statusMsg.classList.remove('hidden');
+                }
+                
+                updateSyncUI(0, totalItems, 'Iniciando...');
                 
                 for (const item of queueItems) {
+                    processedCount++;
+                    const itemName = `${item.tableName} #${item.itemId}`;
+                    updateSyncUI(processedCount, totalItems, `Enviando ${itemName}...`);
+                    
                     try {
                         // Skip if already processing
                         if (item.status === 'processing') continue;
@@ -922,14 +943,49 @@
                             // Limpar campos que não devem ir para o Supabase
                             const cleanSyncData = { ...syncData };
                             delete cleanSyncData.id; 
+                            delete cleanSyncData.synced; // Remove campo local 'synced'
 
                             console.log(`[Sync] Enviando ${item.action} para ${supabaseTableName} (ID: ${item.itemId})`);
 
-                            const { error } = await supabaseClient
-                                .from(supabaseTableName)
-                                .upsert({ ...cleanSyncData, id: item.itemId }, { onConflict: 'id' });
+                            // Otimização para rotas: remover pontos desnecessários se a rota for muito longa
+                            if (item.tableName === 'routes' && cleanSyncData.path && cleanSyncData.path.length > 500) {
+                                console.warn(`[Sync] Rota ${item.itemId} muito longa (${cleanSyncData.path.length} pts). Simplificando...`);
+                                // Mantém 1 a cada N pontos para reduzir tamanho
+                                const factor = Math.ceil(cleanSyncData.path.length / 500);
+                                cleanSyncData.path = cleanSyncData.path.filter((_, i) => i % factor === 0 || i === cleanSyncData.path.length - 1);
+                                console.log(`[Sync] Rota simplificada para ${cleanSyncData.path.length} pontos.`);
+                            }
+
+                            // Timeout manual de 30 segundos para evitar travamento infinito
+                            const timeoutPromise = new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Sync Timeout')), 30000)
+                            );
+
+                            // Execute a promessa e trate o resultado
+                            let error = null;
+                            try {
+                                const result = await Promise.race([
+                                    supabaseClient
+                                        .from(supabaseTableName)
+                                        .upsert({ ...cleanSyncData, id: item.itemId }, { onConflict: 'id' }),
+                                    timeoutPromise
+                                ]);
+                                error = result && result.error ? result.error : null;
+                            } catch (e) {
+                                error = e;
+                            }
                             
                             if (error) {
+                                // Erro de Timeout ou Falha de Rede
+                                if (error.message === 'Sync Timeout' || error.message.includes('Failed to fetch')) {
+                                    console.warn(`[Sync] Timeout/Rede ao sincronizar ${item.tableName}/${item.itemId}. Tentando novamente mais tarde.`);
+                                    await db.syncQueue.update(item.id, { 
+                                        status: 'pending', 
+                                        retries: (item.retries || 0) + 1,
+                                        error: 'Network Timeout'
+                                    });
+                                    continue;
+                                }
                                 // Erro de Conflito (409) - Tentar forçar update se o upsert falhar
                                 if (error.code === '409' || error.status === 409) {
                                     console.warn(`[Sync] Conflito (409) em ${item.tableName}/${item.itemId}. Tentando update explícito...`);
@@ -952,6 +1008,31 @@
                                     await db.syncQueue.delete(item.id);
                                     continue;
                                 }
+                                // Se for erro de coluna inexistente (PGRST204), remover a coluna problemática do payload
+                                if (error.code === 'PGRST204') {
+                                    console.warn(`[Sync] Coluna inexistente no servidor: ${error.message}. Tentando reenviar sem o campo problemático...`);
+                                    
+                                    // Tenta identificar o campo problemático na mensagem de erro
+                                    // Ex: "Could not find the 'synced' column of 'routes' in the schema cache"
+                                    const match = error.message.match(/'([^']+)' column/);
+                                    if (match && match[1]) {
+                                        const badField = match[1];
+                                        console.log(`[Sync] Removendo campo '${badField}' e tentando novamente.`);
+                                        delete cleanSyncData[badField];
+                                        
+                                        const { error: retryError } = await supabaseClient
+                                            .from(supabaseTableName)
+                                            .upsert({ ...cleanSyncData, id: item.itemId }, { onConflict: 'id' });
+                                            
+                                        if (!retryError) {
+                                            console.log(`[Sync] Sucesso após remover campo inválido.`);
+                                            await db.syncQueue.delete(item.id);
+                                            updateSyncUI(processedCount, totalItems, `Sucesso: ${itemName}`);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                
                                 // Se for erro de chave estrangeira (23503), vamos tentar novamente mais tarde
                                 if (error.code === '23503') {
                                     console.warn(`[Sync] Erro FK para ${item.tableName}/${item.itemId} (Code: ${error.code}). Detalhes: ${error.details || error.message}`);
@@ -1000,24 +1081,68 @@
                         }
                         
                         // If successful, remove from queue
-                        await db.syncQueue.delete(item.id);
+                        if (item.id) {
+                            await db.syncQueue.delete(item.id);
+                        } else {
+                            console.warn('[Sync] Tentativa de deletar item sem ID da fila. Ignorando.');
+                        }
+                        updateSyncUI(processedCount, totalItems, `Sucesso: ${itemName}`);
                         
                     } catch (error) {
                         console.error(`[Sync] Erro crítico no item ${item.id}:`, error);
+                        updateSyncUI(processedCount, totalItems, `Erro em ${itemName}`);
                         
-                        // Increment retries or fail
-                        if (item.retries >= 5) {
-                            await db.syncQueue.update(item.id, { status: 'failed', error: error.message });
-                        } else {
-                            await db.syncQueue.update(item.id, { 
-                                status: 'pending', 
-                                retries: (item.retries || 0) + 1 
-                            });
+                        if (item.id) {
+                            // Increment retries or fail
+                            if (item.retries >= 5) {
+                                await db.syncQueue.update(item.id, { status: 'failed', error: error.message });
+                            } else {
+                                await db.syncQueue.update(item.id, { 
+                                    status: 'pending', 
+                                    retries: (item.retries || 0) + 1 
+                                });
+                            }
                         }
                     }
                 }
+                
+                // Finalizar UI
+                setTimeout(() => {
+                    updateSyncUI(totalItems, totalItems, 'Sincronização concluída.');
+                    setTimeout(() => {
+                        const progressContainer = document.getElementById('sync-progress-container');
+                        const statusMsg = document.getElementById('sync-current-item');
+                        if (progressContainer) progressContainer.classList.add('hidden');
+                        if (statusMsg) statusMsg.classList.add('hidden');
+                        checkSyncStatus(); // Refresh status message
+                    }, 2000);
+                }, 500);
+
             } finally {
                 isSyncing = false;
+            }
+        }
+        
+        function updateSyncUI(current, total, message) {
+            const container = document.getElementById('sync-status-container');
+            const progressContainer = document.getElementById('sync-progress-container');
+            const progressBar = document.getElementById('sync-progress-bar');
+            const statusMsg = document.getElementById('sync-current-item');
+            const mainMsg = document.getElementById('sync-status-message');
+            
+            if (container && progressContainer && progressBar && statusMsg) {
+                container.classList.remove('hidden');
+                progressContainer.classList.remove('hidden');
+                statusMsg.classList.remove('hidden');
+                
+                // Ensure values are numbers
+                const currentNum = Number(current) || 0;
+                const totalNum = Number(total) || 1;
+                
+                const percentage = Math.round((currentNum / totalNum) * 100);
+                progressBar.style.width = `${percentage}%`;
+                statusMsg.textContent = message;
+                mainMsg.textContent = `Sincronizando ${currentNum}/${totalNum} itens...`;
             }
         }
         
@@ -2629,15 +2754,24 @@
                         <!-- Check for failed sync items -->
                         <div id="sync-status-container" class="mt-8 hidden">
                             <div class="bg-yellow-50 dark:bg-yellow-900/20 rounded-lg border border-yellow-200 dark:border-yellow-800 text-yellow-800 dark:text-yellow-200 p-4">
-                                <div class="flex">
-                                    <i class="fas fa-exclamation-triangle mt-1 mr-2"></i>
-                                    <div>
-                                        <p class="font-medium">Problemas de sincronização</p>
-                                        <p class="text-sm mt-1" id="sync-status-message">Existem itens pendentes de sincronização.</p>
-                                        <button onclick="retryFailedSyncs()" class="mt-2 text-sm px-3 py-1 bg-yellow-200 dark:bg-yellow-700 rounded hover:bg-yellow-300 dark:hover:bg-yellow-600 transition-colors">
-                                            Tentar sincronizar novamente
-                                        </button>
+                                <div class="flex flex-col">
+                                    <div class="flex items-center mb-2">
+                                        <i class="fas fa-exclamation-triangle mt-1 mr-2"></i>
+                                        <div>
+                                            <p class="font-medium">Sincronização</p>
+                                            <p class="text-sm mt-1" id="sync-status-message">Existem itens pendentes.</p>
+                                        </div>
                                     </div>
+                                    
+                                    <!-- Progress Bar -->
+                                    <div id="sync-progress-container" class="w-full bg-yellow-200 dark:bg-yellow-800 rounded-full h-2.5 mb-2 hidden">
+                                        <div id="sync-progress-bar" class="bg-yellow-600 h-2.5 rounded-full" style="width: 0%"></div>
+                                    </div>
+                                    <p id="sync-current-item" class="text-xs text-yellow-700 dark:text-yellow-300 mb-2 hidden">Sincronizando...</p>
+
+                                    <button id="retry-sync-btn" onclick="retryFailedSyncs()" class="mt-2 text-sm px-3 py-1 bg-yellow-200 dark:bg-yellow-700 rounded hover:bg-yellow-300 dark:hover:bg-yellow-600 transition-colors w-full sm:w-auto">
+                                        <i class="fas fa-sync-alt mr-1"></i> Tentar sincronizar agora
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -3548,10 +3682,7 @@
                                     mapEl.classList.remove('hidden');
                                     
                                     if (!mapInstance) {
-                                        mapInstance = L.map('frontFarmMap');
-                                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                                            attribution: '&copy; OpenStreetMap contributors'
-                                        }).addTo(mapInstance);
+                                        mapInstance = initMapWithLayers('frontFarmMap', [-23.5505, -46.6333], 15);
                                     }
                                     
                                     if (geoLayer) {
@@ -4285,8 +4416,20 @@
                                             <div id="battery-indicator" class="h-full bg-green-500 rounded-full" style="width: 100%;"></div>
                                         </div>
                                     </div>
+
+                                    <div class="mb-6 bg-gray-50 dark:bg-gray-700 p-3 rounded-lg">
+                                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Modo de Registro</label>
+                                        <div class="flex space-x-2">
+                                            <button type="button" onclick="setRecordingMode('gps')" id="mode-gps" class="flex-1 py-2 px-3 rounded-md text-sm font-medium bg-primary-600 text-white shadow-sm transition-colors">
+                                                <i class="fas fa-satellite-dish mr-1"></i> GPS
+                                            </button>
+                                            <button type="button" onclick="setRecordingMode('manual')" id="mode-manual" class="flex-1 py-2 px-3 rounded-md text-sm font-medium bg-white dark:bg-gray-600 text-gray-700 dark:text-gray-200 border border-gray-300 dark:border-gray-500 hover:bg-gray-50 dark:hover:bg-gray-500 transition-colors">
+                                                <i class="fas fa-hand-pointer mr-1"></i> Manual
+                                            </button>
+                                        </div>
+                                    </div>
                                     
-                                    <div class="grid grid-cols-1 gap-3 mt-6">
+                                    <div id="gps-controls" class="grid grid-cols-1 gap-3 mt-6">
                                         <button id="startButton" onclick="startRecording(${frontId})" class="px-4 py-3 bg-green-500 hover:bg-green-600 text-white rounded-lg shadow-md font-medium flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2">
                                             <i class="fas fa-play mr-2"></i> Iniciar Gravação
                                         </button>
@@ -4301,6 +4444,24 @@
                                         </button>
                                         <button id="centerMapButton" onclick="centerMapOnCurrentLocation()" class="px-4 py-3 bg-gray-500 hover:bg-gray-600 text-white rounded-lg shadow-md font-medium flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2">
                                             <i class="fas fa-crosshairs mr-2"></i> Centralizar Mapa
+                                        </button>
+                                    </div>
+                                    
+                                    <!-- Controles Manuais (inicialmente ocultos) -->
+                                    <div id="manual-controls" class="hidden grid grid-cols-1 gap-3 mt-4 mb-6">
+                                        <div class="bg-blue-50 dark:bg-blue-900/20 p-3 rounded text-sm text-blue-800 dark:text-blue-200 mb-2">
+                                            <i class="fas fa-info-circle mr-1"></i> Clique no mapa para adicionar pontos à rota.
+                                        </div>
+                                        <div class="grid grid-cols-2 gap-2">
+                                            <button type="button" onclick="undoManualPoint()" class="px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg shadow-md font-medium flex items-center justify-center">
+                                                <i class="fas fa-undo mr-2"></i> Desfazer
+                                            </button>
+                                            <button type="button" onclick="clearManualRoute()" class="px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg shadow-md font-medium flex items-center justify-center">
+                                                <i class="fas fa-trash mr-2"></i> Limpar
+                                            </button>
+                                        </div>
+                                        <button type="button" onclick="saveManualRoute(${frontId})" class="px-4 py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg shadow-md font-medium flex items-center justify-center mt-2">
+                                            <i class="fas fa-save mr-2"></i> Salvar Rota Manual
                                         </button>
                                     </div>
                                 </div>
@@ -4515,37 +4676,47 @@
         
         async function renderRouteDetailsView(frontId, routeId) {
             try {
-                const fId = parseInt(frontId);
-                const rId = routeId ? parseInt(routeId) : null;
+                // Ensure IDs are numbers
+                const fId = Number(frontId);
+                const rId = Number(routeId);
                 
-                if (rId === null || isNaN(rId)) {
-                    throw new Error("ID da rota inválido");
+                if (isNaN(rId)) {
+                    console.error("ID da rota inválido (NaN):", routeId);
+                    showToast("ID da rota inválido", "error");
+                    showView('routes');
+                    return;
                 }
                 
                 // Fetch front and route in parallel
                 let [front, route] = await Promise.all([
-                    fId !== 0 ? db.harvestFronts.get(fId) : Promise.resolve(null),
+                    !isNaN(fId) && fId !== 0 ? db.harvestFronts.get(fId) : Promise.resolve(null),
                     db.routes.get(rId)
                 ]);
                 
                 // Handle suggested routes or missing fronts
                 if (!front) {
-                    if (fId === 0) {
+                    if (fId === 0 || isNaN(fId)) {
                         front = {
                             id: 0,
-                            name: 'Rota Sugerida',
+                            name: 'Rota Sugerida / Geral',
                             color: '#9CA3AF',
                             location: 'Geral',
                             status: 'active'
                         };
                     } else {
-                        showToast('Frente de colheita não encontrada', 'error');
-                        showView('routes');
-                        return;
+                        // Se a frente não existe, usa um placeholder para não quebrar a tela
+                        front = {
+                            id: fId,
+                            name: 'Frente Desconhecida',
+                            color: '#9CA3AF',
+                            location: 'N/A',
+                            status: 'unknown'
+                        };
                     }
                 }
                 
                 if (!route) {
+                    console.error("Rota não encontrada no banco local:", rId);
                     showToast('Rota não encontrada', 'error');
                     showView('routes');
                     return;
@@ -4557,8 +4728,8 @@
                 }
                 
                 const appView = document.getElementById('app-view');
-                appView.dataset.frontId = frontId;
-                appView.dataset.routeId = routeId;
+                appView.dataset.frontId = fId || 0;
+                appView.dataset.routeId = rId;
                 
                 // Robust date handling
                 const rawStartDate = route.startTime || route.createdAt || new Date();
@@ -4575,8 +4746,8 @@
                 let distance = route.distance || 0;
                 if (!distance && route.path && route.path.length >= 2) {
                     distance = calculateRouteDistance(route.path);
-                    // Update route in database with calculated distance
-                    await db.routes.update(route.id, { distance });
+                    // Update route in database with calculated distance (async, don't wait)
+                    db.routes.update(route.id, { distance }).catch(e => console.warn('Erro ao atualizar distância:', e));
                 }
                 
                 // Calculate statistics
@@ -5452,11 +5623,7 @@
                     navigationState.map = null;
                 }
                 
-                const map = L.map(mapContainer).setView(startPoint, 15);
-                
-                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                }).addTo(map);
+                const map = initMapWithLayers(mapContainer, startPoint, 15);
                 
                 // Create route path
                 const routePath = route.path.map(point => [point.lat, point.lng]);
@@ -8200,18 +8367,17 @@
                                     const mapElement = document.getElementById(mapId);
                                     
                                     if (mapElement) {
-                                        const miniMap = L.map(mapId, {
-                                            zoomControl: false,
-                                            attributionControl: false,
-                                            dragging: false,
-                                            scrollWheelZoom: false,
-                                            doubleClickZoom: false,
-                                            boxZoom: false,
-                                            keyboard: false
-                                        });
+                                        const miniMap = initMapWithLayers(mapId, [-23.5505, -46.6333], 13);
                                         
-                                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(miniMap);
-                                        
+                                        // Disable interactions
+                                        miniMap.dragging.disable();
+                                        miniMap.touchZoom.disable();
+                                        miniMap.doubleClickZoom.disable();
+                                        miniMap.scrollWheelZoom.disable();
+                                        miniMap.boxZoom.disable();
+                                        miniMap.keyboard.disable();
+                                        if (miniMap.tap) miniMap.tap.disable();
+
                                         const layer = L.geoJSON(farm.geoJson, {
                                             style: {
                                                 color: '#10B981', 
@@ -8226,9 +8392,6 @@
                                         } else {
                                             miniMap.setView([-23.5505, -46.6333], 10);
                                         }
-                                        
-                                        // Disable interactions
-                                        miniMap.touchZoom.disable();
                                     }
                                 } catch (e) {
                                     console.error(`Error initializing mini map for farm ${farm.id}:`, e);
@@ -8382,10 +8545,7 @@
                 container.classList.remove('hidden');
                 
                 if (!currentFarmPreviewMap) {
-                    currentFarmPreviewMap = L.map('farm-preview-map').setView([lat, lng], 15);
-                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                        attribution: '&copy; OpenStreetMap contributors'
-                    }).addTo(currentFarmPreviewMap);
+                    currentFarmPreviewMap = initMapWithLayers('farm-preview-map', [lat, lng], 15);
                 } else {
                     currentFarmPreviewMap.eachLayer((layer) => {
                         if (layer instanceof L.GeoJSON || layer instanceof L.Marker) {
@@ -8403,11 +8563,39 @@
             }
         }
 
+        // Base layers for maps
+        const baseLayers = {
+            "Mapa Padrão": L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }),
+            "Satélite (Esri)": L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+            }),
+            "Satélite (Google)": L.tileLayer('http://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '&copy; Google Maps'
+            })
+        };
+
+        function initMapWithLayers(mapId, center, zoom) {
+            const map = L.map(mapId).setView(center, zoom);
+            baseLayers["Mapa Padrão"].addTo(map);
+            L.control.layers(baseLayers).addTo(map);
+            return map;
+        }
+
         function previewFarmKml(event) {
             const file = event.target.files[0];
             if (!file) return;
             
+            const fileName = file.name.replace(/\.kml$/i, '');
             document.getElementById('farmKmlFileName').textContent = file.name;
+            // Preencher automaticamente o nome se estiver vazio
+            const nameInput = document.getElementById('farmName');
+            if (!nameInput.value) {
+                nameInput.value = fileName;
+            }
             
             const reader = new FileReader();
             reader.onload = function(e) {
@@ -8421,7 +8609,15 @@
                     }
                     
                     const geojson = toGeoJSON.kml(kmlDom);
-                    currentFarmGeoJson = geojson; // Store for saving
+                    
+                    // Suporte a múltiplos polígonos/fazendas em um único arquivo
+                    // Se houver múltiplas features, armazena como FeatureCollection
+                    if (geojson.features && geojson.features.length > 0) {
+                         currentFarmGeoJson = geojson; // Store for saving
+                         console.log(`[KML] Importado com ${geojson.features.length} features.`);
+                    } else {
+                        throw new Error('Nenhuma geometria válida encontrada no KML.');
+                    }
                     
                     // Show map container
                     const container = document.getElementById('farmMapPreviewContainer');
@@ -8429,26 +8625,28 @@
                     
                     // Init map if needed
                     if (!currentFarmPreviewMap) {
-                        currentFarmPreviewMap = L.map('farm-preview-map').setView([-23.5505, -46.6333], 13);
-                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                            attribution: '&copy; OpenStreetMap contributors'
-                        }).addTo(currentFarmPreviewMap);
+                        currentFarmPreviewMap = initMapWithLayers('farm-preview-map', [-23.5505, -46.6333], 13);
                     } else {
-                        // Clear existing layers
+                        // Clear existing layers but keep base layers
                         currentFarmPreviewMap.eachLayer((layer) => {
-                            if (layer instanceof L.GeoJSON) {
+                            if (layer instanceof L.GeoJSON || layer instanceof L.Marker || layer instanceof L.Polyline) {
                                 currentFarmPreviewMap.removeLayer(layer);
                             }
                         });
                     }
                     
-                    // Add new layer
+                    // Add new layer with popup for each feature
                     const layer = L.geoJSON(geojson, {
                         style: {
                             color: '#10B981', // Emerald 500
                             weight: 2,
                             opacity: 0.8,
                             fillOpacity: 0.2
+                        },
+                        onEachFeature: function(feature, layer) {
+                            if (feature.properties && feature.properties.name) {
+                                layer.bindPopup(feature.properties.name);
+                            }
                         }
                     }).addTo(currentFarmPreviewMap);
                     
@@ -8456,12 +8654,11 @@
                     const bounds = layer.getBounds();
                     if (bounds.isValid()) {
                         currentFarmPreviewMap.fitBounds(bounds);
-                        currentFarmPreviewMap.invalidateSize();
                     }
                     
                 } catch (error) {
                     console.error('Erro ao ler KML:', error);
-                    showToast('Erro ao ler arquivo KML.', 'error');
+                    showToast('Erro ao ler arquivo KML: ' + error.message, 'error');
                 }
             };
             reader.readAsText(file);
@@ -8831,10 +9028,214 @@
             reader.readAsText(file);
         }
 
+        // Variáveis globais para o modo manual
+        let recordingMode = 'gps';
+        let manualRoutePoints = [];
+        let manualRoutePolyline = null;
+        let manualMarkers = [];
+
+        function setRecordingMode(mode) {
+            recordingMode = mode;
+            
+            // UI updates
+            const gpsBtn = document.getElementById('mode-gps');
+            const manualBtn = document.getElementById('mode-manual');
+            const gpsControls = document.getElementById('gps-controls');
+            const manualControls = document.getElementById('manual-controls');
+            
+            if (!gpsBtn || !manualBtn) return;
+
+            if (mode === 'gps') {
+                gpsBtn.classList.add('bg-primary-600', 'text-white');
+                gpsBtn.classList.remove('bg-white', 'text-gray-700', 'border');
+                manualBtn.classList.remove('bg-primary-600', 'text-white');
+                manualBtn.classList.add('bg-white', 'text-gray-700', 'border');
+                
+                gpsControls.classList.remove('hidden');
+                manualControls.classList.add('hidden');
+                
+                // Disable manual map interactions
+                if (currentRecording.map) {
+                    currentRecording.map.off('click', handleMapClick);
+                    currentRecording.map.dragging.enable();
+                    currentRecording.map.getContainer().style.cursor = '';
+                }
+            } else {
+                manualBtn.classList.add('bg-primary-600', 'text-white');
+                manualBtn.classList.remove('bg-white', 'text-gray-700', 'border');
+                gpsBtn.classList.remove('bg-primary-600', 'text-white');
+                gpsBtn.classList.add('bg-white', 'text-gray-700', 'border');
+                
+                gpsControls.classList.add('hidden');
+                manualControls.classList.remove('hidden');
+                
+                // Enable manual map interactions
+                if (currentRecording.map) {
+                    currentRecording.map.on('click', handleMapClick);
+                    currentRecording.map.getContainer().style.cursor = 'crosshair';
+                }
+                
+                // Initialize manual route if needed
+                if (!manualRoutePolyline && currentRecording.map) {
+                    manualRoutePolyline = L.polyline([], {color: '#EF4444', weight: 4, dashArray: '5, 5'}).addTo(currentRecording.map);
+                }
+            }
+        }
+
+        function handleMapClick(e) {
+            if (recordingMode !== 'manual') return;
+            addManualPoint(e.latlng);
+        }
+
+        function addManualPoint(latlng) {
+            const point = {
+                lat: latlng.lat,
+                lng: latlng.lng,
+                timestamp: Date.now()
+            };
+            
+            manualRoutePoints.push(point);
+            
+            // Update map
+            if (currentRecording.map) {
+                // Add marker
+                const marker = L.circleMarker([point.lat, point.lng], {
+                    radius: 4,
+                    color: '#EF4444',
+                    fillColor: '#FFFFFF',
+                    fillOpacity: 1,
+                    weight: 2
+                }).addTo(currentRecording.map);
+                manualMarkers.push(marker);
+                
+                // Update polyline
+                const latlngs = manualRoutePoints.map(p => [p.lat, p.lng]);
+                if (!manualRoutePolyline) {
+                     manualRoutePolyline = L.polyline(latlngs, {color: '#EF4444', weight: 4, dashArray: '5, 5'}).addTo(currentRecording.map);
+                } else {
+                    manualRoutePolyline.setLatLngs(latlngs);
+                }
+                
+                // Update stats (distance)
+                updateManualStats();
+            }
+        }
+
+        function undoManualPoint() {
+            if (manualRoutePoints.length === 0) return;
+            
+            manualRoutePoints.pop();
+            const marker = manualMarkers.pop();
+            if (marker) marker.remove();
+            
+            const latlngs = manualRoutePoints.map(p => [p.lat, p.lng]);
+            if (manualRoutePolyline) {
+                manualRoutePolyline.setLatLngs(latlngs);
+            }
+            updateManualStats();
+        }
+
+        function clearManualRoute() {
+            manualRoutePoints = [];
+            manualMarkers.forEach(m => m.remove());
+            manualMarkers = [];
+            if (manualRoutePolyline) manualRoutePolyline.setLatLngs([]);
+            updateManualStats();
+        }
+
+        function updateManualStats() {
+            // Calculate distance
+            let dist = 0;
+            for (let i = 1; i < manualRoutePoints.length; i++) {
+                dist += calculateDistance(manualRoutePoints[i-1], manualRoutePoints[i]);
+            }
+            
+            const distEl = document.getElementById('distance-count');
+            const pointsEl = document.getElementById('points-count');
+            
+            if (distEl) distEl.innerText = dist.toFixed(2) + ' km';
+            if (pointsEl) pointsEl.innerText = manualRoutePoints.length;
+        }
+
+        async function saveManualRoute(frontId) {
+            if (manualRoutePoints.length < 2) {
+                showToast('Adicione pelo menos 2 pontos para salvar a rota.', 'warning');
+                return;
+            }
+            
+            const nameInput = document.getElementById('routeName');
+            const descInput = document.getElementById('routeDescription');
+            const tagsInput = document.getElementById('routeTags');
+            
+            const name = nameInput.value || 'Rota Manual ' + new Date().toLocaleString();
+            const description = descInput ? descInput.value : '';
+            const tagsStr = tagsInput ? tagsInput.value : '';
+            const tags = tagsStr.split(',').map(t => t.trim()).filter(t => t);
+            
+            if (!tags.includes('manual')) tags.push('manual');
+            
+            try {
+                const id = generateNumericID();
+                const timestamps = {
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString()
+                };
+                
+                const dist = parseFloat(document.getElementById('distance-count').innerText) || 0;
+                
+                const routeData = {
+                    id: parseInt(id), // Garante ID numérico
+                    name,
+                    description,
+                    tags,
+                    frontId: parseInt(frontId),
+                    path: manualRoutePoints,
+                    distance: dist,
+                    duration: 0,
+                    averageSpeed: 0,
+                    startTime: new Date(manualRoutePoints[0].timestamp).toISOString(),
+                    endTime: new Date(manualRoutePoints[manualRoutePoints.length - 1].timestamp).toISOString(),
+                    status: 'completed',
+                    synced: 0,
+                    ...timestamps
+                };
+                
+                // Salvar local imediato
+                console.log('Salvando rota manual:', routeData);
+                
+                // Tenta adicionar ao banco local
+                const addedId = await db.routes.add(routeData);
+                console.log('Rota salva localmente com ID:', addedId);
+                
+                // Adiciona à fila de sincronização
+                await addToSyncQueue('create', 'routes', id, routeData);
+                
+                showToast('Rota manual salva com sucesso!', 'success');
+                
+                // Reset and go back
+                clearManualRoute();
+                
+                // Pequeno delay para garantir que o banco atualizou antes de mudar a tela
+                setTimeout(() => {
+                    showView('routes', { frontId: parseInt(frontId) });
+                }, 100);
+                
+            } catch (error) {
+                console.error('Erro ao salvar rota manual:', error);
+                showToast('Erro ao salvar rota: ' + error.message, 'error');
+            }
+        }
+
         function initRecordMap() {
             const mapContainer = document.getElementById('record-map');
             if (!mapContainer) return;
             
+            // Reset manual variables
+            manualRoutePoints = [];
+            manualMarkers = [];
+            manualRoutePolyline = null;
+            recordingMode = 'gps'; // Reset to GPS default
+
             // Initialize map with Leaflet
             // Check if map already exists in container (Leaflet requires this)
             if (currentRecording.map) {
@@ -8842,11 +9243,7 @@
                 currentRecording.map = null;
             }
 
-            const map = L.map(mapContainer).setView([-23.5505, -46.6333], 15);
-            
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            }).addTo(map);
+            const map = initMapWithLayers('record-map', [-23.5505, -46.6333], 15);
             
             // Create polyline for recording path
             const routePolyline = L.polyline([], {
@@ -9345,12 +9742,8 @@
                     window.operationsMap = null;
                 }
 
-                const map = L.map(mapContainer).setView([-15.7801, -47.9292], 5);
+                const map = initMapWithLayers('operations-map', [-15.7801, -47.9292], 5);
                 window.operationsMap = map;
-                
-                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                }).addTo(map);
                 
                 // Load data in parallel
                 Promise.all([
@@ -9527,11 +9920,7 @@
                 }
 
                 // Create map
-                const map = L.map(mapContainer).setView([route.path[0].lat, route.path[0].lng], 12);
-                
-                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                }).addTo(map);
+                const map = initMapWithLayers(mapContainer, [route.path[0].lat, route.path[0].lng], 12);
                 
                 // Create path for route
                 const routePath = route.path.map(point => [point.lat, point.lng]);
