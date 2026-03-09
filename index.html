@@ -8708,6 +8708,18 @@
                 showToast('Por favor, preencha o nome e importe um KML ou digite coordenadas válidas.', 'warning');
                 return;
             }
+
+            // Verificação de duplicidade de nome
+            try {
+                const normalizedName = name.trim().toLowerCase();
+                const existingFarm = await db.farms.filter(f => f.name && f.name.trim().toLowerCase() === normalizedName).first();
+                if (existingFarm) {
+                    showToast(`A fazenda "${name}" já está cadastrada!`, 'error');
+                    return;
+                }
+            } catch (error) {
+                console.error("Erro ao verificar duplicidade:", error);
+            }
             
             try {
                 const id = generateNumericID();
