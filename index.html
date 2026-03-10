@@ -24,7 +24,16 @@
         // Supabase Configuration
         const SUPABASE_URL = 'https://luekwjjoqdlicnwactal.supabase.co';
         const SUPABASE_KEY = 'sb_publishable_KAsRaNSeEj6V8hN567pv2w_l-Qx_E9_';
-        const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+        let __supabaseStorage;
+        try { __supabaseStorage = window.localStorage; } catch (e) { __supabaseStorage = undefined; }
+        const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+            auth: {
+                persistSession: true,
+                autoRefreshToken: false,
+                detectSessionInUrl: false,
+                storage: __supabaseStorage
+            }
+        });
     </script>
     <script>
         tailwind.config = {
@@ -435,16 +444,44 @@
         .modal-overlay.active {
             opacity: 1;
         }
+
+        .modal-overlay {
+            overscroll-behavior: contain;
+        }
         
         .modal-container {
             transform: translateY(20px);
             opacity: 0;
             transition: transform 0.3s ease, opacity 0.3s ease;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
         }
         
         .modal-overlay.active .modal-container {
             transform: translateY(0);
             opacity: 1;
+        }
+
+        #modal-content {
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: contain;
+            touch-action: pan-y;
+        }
+
+        @media (max-width: 640px) {
+            .modal-overlay {
+                align-items: flex-start !important;
+                padding-top: 1rem;
+                padding-bottom: 1rem;
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+
+            .modal-container {
+                max-height: calc(100vh - 2rem);
+            }
         }
         
         /* Print styles */
@@ -593,7 +630,7 @@
                     <i class="fas fa-times"></i>
                 </button>
             </div>
-            <div id="modal-content" class="p-4">
+            <div id="modal-content" class="p-4 overflow-y-auto flex-1">
                 <!-- Dynamic content will be inserted here -->
             </div>
             <div id="modal-footer" class="p-4 border-t border-gray-200 dark:border-gray-700 flex justify-end space-x-3">
@@ -675,6 +712,16 @@
             settings: 'key',
             syncQueue: '++id, action, tableName, itemId, data, timestamp, retries, status'
         });
+        db.version(3).stores({
+            harvestFronts: 'id, name, status, createdAt, updatedAt',
+            routes: 'id, frontId, farmId, startTime, status, createdAt, updatedAt, *tags',
+            drivers: 'id, name, status, assignedFront, createdAt, updatedAt',
+            farms: 'id, name, status, createdAt, updatedAt',
+            users: 'id, name, role, email, status, profile_completed',
+            settings: 'key',
+            syncQueue: '++id, action, tableName, itemId, data, timestamp, retries, status',
+            routeSessions: 'id, routeId, frontId, farmId, driverId, startTime, endTime, distanceKm, durationMin, status, createdAt, updatedAt'
+        });
         
         // Add hooks for sync queue when we're back online
         db.on('ready', () => {
@@ -752,22 +799,87 @@
             return newObj;
         }
 
+        function normalizeRole(role) {
+            const r = String(role || '').toLowerCase().trim();
+            if (!r) return '';
+            if (r === 'driver' || r === 'motorista') return 'driver';
+            if (r === 'leader' || r.includes('lider') || r.includes('líder') || r.includes('gestor')) return 'leader';
+            if (r === 'controller' || r.includes('controle')) return 'controller';
+            if (r === 'supervisor') return 'supervisor';
+            if (r === 'admin') return 'admin';
+            if (r === 'operator' || r.includes('operador')) return 'operator';
+            return r;
+        }
+        
+        function getUserDisplayName(u) {
+            const name = (u && u.name) ? String(u.name).trim() : '';
+            if (name) return name;
+            const email = (u && u.email) ? String(u.email).trim() : '';
+            if (email) return email;
+            return 'Sem nome';
+        }
+
+        let __supabaseAuthQueue = Promise.resolve();
+        
+        function enqueueSupabaseAuth(fn) {
+            const run = async () => {
+                for (let attempt = 0; attempt < 6; attempt++) {
+                    try {
+                        return await fn();
+                    } catch (e) {
+                        const msg = (e && (e.message || String(e))) || '';
+                        if (e?.name === 'AbortError' || msg.includes('Lock broken by another request')) {
+                            await new Promise(r => setTimeout(r, 60 * (attempt + 1)));
+                            continue;
+                        }
+                        throw e;
+                    }
+                }
+                return await fn();
+            };
+            
+            const p = __supabaseAuthQueue.then(run, run);
+            __supabaseAuthQueue = p.catch(() => {});
+            return p;
+        }
+        
+        async function getSessionSafe() {
+            return enqueueSupabaseAuth(() => supabaseClient.auth.getSession());
+        }
+        
+        async function setSessionSafe(tokens) {
+            return enqueueSupabaseAuth(() => supabaseClient.auth.setSession(tokens));
+        }
+
+        async function signUpSafe(payload) {
+            return enqueueSupabaseAuth(() => supabaseClient.auth.signUp(payload));
+        }
+        
+        async function signInWithPasswordSafe(payload) {
+            return enqueueSupabaseAuth(() => supabaseClient.auth.signInWithPassword(payload));
+        }
+        
+        async function signOutSafe() {
+            return enqueueSupabaseAuth(() => supabaseClient.auth.signOut());
+        }
+
         const TABLE_MAP = {
             'harvestFronts': 'harvest_fronts',
             'routes': 'routes',
             'drivers': 'drivers',
             'farms': 'farms',
-            'users': 'users'
+            'users': 'users',
+            'routeSessions': 'route_sessions'
         };
 
         // Sincronização delta otimizada com reconciliação de deleções
         async function syncAllFromSupabase() {
             if (!navigator.onLine) return;
             
-            const { data: { session } } = await supabaseClient.auth.getSession();
+            const { data: { session } } = await getSessionSafe();
             if (!session) return;
             
-            const dexieTables = ['harvestFronts', 'routes', 'drivers', 'farms', 'users'];
+            const dexieTables = ['harvestFronts', 'routes', 'drivers', 'farms', 'users', 'routeSessions'];
             const startTime = performance.now();
             
             console.log('[Sync] Iniciando sincronização delta e reconciliação...');
@@ -781,35 +893,53 @@
                     const batch = dexieTables.slice(i, i + BATCH_SIZE);
                     const batchPromises = batch.map(async (dexieTableName) => {
                         const supabaseTableName = TABLE_MAP[dexieTableName];
+                        let updatedCount = 0;
                         
                         // 1. DELTA SYNC (Updates/Inserts)
                         const lastSyncKey = `lastSync_${dexieTableName}`;
                         const lastSyncSetting = await db.settings.get(lastSyncKey);
                         const lastSyncTime = lastSyncSetting ? lastSyncSetting.value : '1970-01-01T00:00:00Z';
                         
-                        // Determinar a coluna de timestamp para esta tabela (users usa created_at)
-                        const timestampColumn = dexieTableName === 'users' ? 'created_at' : 'updated_at';
-                        
-                        let query = supabaseClient.from(supabaseTableName).select('*');
-                        if (lastSyncSetting) {
-                            query = query.gt(timestampColumn, lastSyncTime);
-                        }
-                        
-                        const { data: deltas, error: deltaError } = await query.limit(1000);
-                        if (deltaError) throw deltaError;
-                        
-                        if (deltas && deltas.length > 0) {
-                            const validDeltas = dexieTableName === 'users' 
-                                ? deltas 
-                                : deltas.filter(item => !isNaN(item.id) || /^\d+$/.test(item.id));
+                        if (dexieTableName === 'users') {
+                            const { data: allUsers, error: allUsersError } = await supabaseClient
+                                .from('users')
+                                .select('*')
+                                .limit(1000);
+                            if (allUsersError) throw allUsersError;
                             
-                            const camelDeltas = validDeltas.map(item => snakeToCamel(item));
-                            await db[dexieTableName].bulkPut(camelDeltas);
+                            const camelUsers = (allUsers || []).map(item => {
+                                const c = snakeToCamel(item);
+                                c.profile_completed = item.profile_completed;
+                                c.profileCompleted = item.profile_completed;
+                                return c;
+                            });
+                            await db.users.bulkPut(camelUsers);
+                            await db.settings.put({ key: lastSyncKey, value: new Date().toISOString() });
+                            totalUpdated += camelUsers.length;
+                            updatedCount = camelUsers.length;
+                        } else {
+                            const timestampColumn = 'updated_at';
                             
-                            const maxTimestamp = deltas.reduce((max, item) => 
-                                item[timestampColumn] > max ? item[timestampColumn] : max, lastSyncTime);
-                            await db.settings.put({ key: lastSyncKey, value: maxTimestamp });
-                            totalUpdated += validDeltas.length;
+                            let query = supabaseClient.from(supabaseTableName).select('*');
+                            if (lastSyncSetting) {
+                                query = query.gt(timestampColumn, lastSyncTime);
+                            }
+                            
+                            const { data: deltas, error: deltaError } = await query.limit(1000);
+                            if (deltaError) throw deltaError;
+                            
+                            if (deltas && deltas.length > 0) {
+                                const validDeltas = deltas.filter(item => !isNaN(item.id) || /^\d+$/.test(item.id));
+                                
+                                const camelDeltas = validDeltas.map(item => snakeToCamel(item));
+                                await db[dexieTableName].bulkPut(camelDeltas);
+                                
+                                const maxTimestamp = deltas.reduce((max, item) => 
+                                    item[timestampColumn] > max ? item[timestampColumn] : max, lastSyncTime);
+                                await db.settings.put({ key: lastSyncKey, value: maxTimestamp });
+                                totalUpdated += validDeltas.length;
+                                updatedCount = deltas.length;
+                            }
                         }
 
                         // 2. RECONCILIAÇÃO DE DELEÇÕES (Sync offline deletions)
@@ -834,7 +964,7 @@
                             }
                         }
                         
-                        return { updated: deltas ? deltas.length : 0 };
+                        return { updated: updatedCount };
                     });
                     
                     await Promise.all(batchPromises);
@@ -849,8 +979,8 @@
                     }
                     
                     const currentView = AppState.currentView;
-                    const dataDependentViews = ['dashboard', 'harvest-fronts', 'routes', 'farms', 'drivers', 'driver'];
-                    if (dataDependentViews.includes(currentView)) {
+                    const dataDependentViews = ['dashboard', 'harvest-fronts', 'routes', 'farms', 'drivers', 'driver', 'reports'];
+                    if (!window.__suppressSyncViewRefresh && dataDependentViews.includes(currentView)) {
                         showView(currentView, { replace: true, noAnimation: true });
                     }
                 } else {
@@ -894,7 +1024,7 @@
                 
                 console.log(`[Sync] Processando ${queueItems.length} itens...`);
                 
-                const { data: { session } } = await supabaseClient.auth.getSession();
+                const { data: { session } } = await getSessionSafe();
                 
                 if (!session) {
                     console.warn('[Sync] Usuário não autenticado, adiando sincronização.');
@@ -927,12 +1057,14 @@
                         // Skip if already processing
                         if (item.status === 'processing') continue;
                         
-                        // Validação de ID: Se não for numérico, ignorar itens antigos que causam erro de bigint
-                        const isNumericId = !isNaN(item.itemId) || /^\d+$/.test(item.itemId);
-                        if (!isNumericId) {
-                            console.error(`[Sync] Item ${item.id} ignorado por ID inválido (não-numérico): ${item.itemId}`);
-                            await db.syncQueue.delete(item.id);
-                            continue;
+                        const numericIdTables = ['farms', 'harvestFronts', 'drivers', 'routes', 'routeSessions'];
+                        if (numericIdTables.includes(item.tableName)) {
+                            const isNumericId = !isNaN(item.itemId) || /^\d+$/.test(item.itemId);
+                            if (!isNumericId) {
+                                console.error(`[Sync] Item ${item.id} ignorado por ID inválido (não-numérico): ${item.itemId}`);
+                                await db.syncQueue.delete(item.id);
+                                continue;
+                            }
                         }
                         
                         // Mark as processing
@@ -967,9 +1099,9 @@
                             let error = null;
                             try {
                                 const result = await Promise.race([
-                                    supabaseClient
+                                    enqueueSupabaseAuth(() => supabaseClient
                                         .from(supabaseTableName)
-                                        .upsert({ ...cleanSyncData, id: item.itemId }, { onConflict: 'id' }),
+                                        .upsert({ ...cleanSyncData, id: item.itemId }, { onConflict: 'id' })),
                                     timeoutPromise
                                 ]);
                                 error = result && result.error ? result.error : null;
@@ -991,10 +1123,10 @@
                                 // Erro de Conflito (409) - Tentar forçar update se o upsert falhar
                                 if (error.code === '409' || error.status === 409) {
                                     console.warn(`[Sync] Conflito (409) em ${item.tableName}/${item.itemId}. Tentando update explícito...`);
-                                    const { error: updateError } = await supabaseClient
+                                    const { error: updateError } = await enqueueSupabaseAuth(() => supabaseClient
                                         .from(supabaseTableName)
                                         .update(cleanSyncData)
-                                        .eq('id', item.itemId);
+                                        .eq('id', item.itemId));
                                     
                                     if (!updateError) {
                                         console.log(`[Sync] Sucesso após update explícito: ${item.tableName}/${item.itemId}`);
@@ -1022,9 +1154,9 @@
                                         console.log(`[Sync] Removendo campo '${badField}' e tentando novamente.`);
                                         delete cleanSyncData[badField];
                                         
-                                        const { error: retryError } = await supabaseClient
+                                        const { error: retryError } = await enqueueSupabaseAuth(() => supabaseClient
                                             .from(supabaseTableName)
-                                            .upsert({ ...cleanSyncData, id: item.itemId }, { onConflict: 'id' });
+                                            .upsert({ ...cleanSyncData, id: item.itemId }, { onConflict: 'id' }));
                                             
                                         if (!retryError) {
                                             console.log(`[Sync] Sucesso após remover campo inválido.`);
@@ -1074,10 +1206,10 @@
                             }
                             console.log(`[Sync] Sucesso: ${item.tableName}/${item.itemId}`);
                         } else if (item.action === 'delete') {
-                            const { error } = await supabaseClient
+                            const { error } = await enqueueSupabaseAuth(() => supabaseClient
                                 .from(supabaseTableName)
                                 .delete()
-                                .eq('id', item.itemId);
+                                .eq('id', item.itemId));
                             if (error) throw error;
                             console.log(`[Sync] Deletado: ${item.tableName}/${item.itemId}`);
                         }
@@ -1093,6 +1225,9 @@
                     } catch (error) {
                         console.error(`[Sync] Erro crítico no item ${item.id}:`, error);
                         updateSyncUI(processedCount, totalItems, `Erro em ${itemName}`);
+                        if (item.tableName === 'users') {
+                            showToast(`Falha ao enviar usuário para o servidor: ${error.message || error}`, 'error');
+                        }
                         
                         if (item.id) {
                             // Increment retries or fail
@@ -1195,7 +1330,7 @@
                 });
                 console.log(`Added ${action} operation to sync queue for ${tableName} id ${itemId}`);
                 
-                const { data: { session } } = await supabaseClient.auth.getSession();
+                const { data: { session } } = await getSessionSafe();
                 if (navigator.onLine && session) {
                     // Sincronização em background para não travar a UI
                     processSyncQueue().catch(e => console.error('[Sync] Erro no background:', e));
@@ -1460,6 +1595,111 @@
             voiceEnabled: true // Habilitar/desabilitar voz
         };
         
+        let TTS_STATE = { ready: false, voice: null };
+        const TTS = {
+            available: false,
+            mode: 'none',
+            settings: { rate: 1.1, pitch: 1.0, volume: 1.0 },
+            async init() {
+                try {
+                    if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.TextToSpeech) {
+                        this.available = true;
+                        this.mode = 'capacitor';
+                        return true;
+                    }
+                    if (window.TTS && typeof window.TTS.speak === 'function') {
+                        this.available = true;
+                        this.mode = 'cordova';
+                        return true;
+                    }
+                    if ('speechSynthesis' in window) {
+                        setupTTS();
+                        this.available = true;
+                        this.mode = 'web';
+                        return true;
+                    }
+                } catch (_) {}
+                this.available = false;
+                this.mode = 'none';
+                return false;
+            },
+            async loadSettings() {
+                try {
+                    const rate = (await db.settings.get('tts_rate'))?.value ?? 1.1;
+                    const pitch = (await db.settings.get('tts_pitch'))?.value ?? 1.0;
+                    const volume = (await db.settings.get('tts_volume'))?.value ?? 1.0;
+                    this.settings = { rate: Number(rate), pitch: Number(pitch), volume: Number(volume) };
+                } catch (_) {}
+            },
+            async saveSettings(partial) {
+                this.settings = { ...this.settings, ...partial };
+                try {
+                    if (partial.rate !== undefined) await db.settings.put({ key: 'tts_rate', value: this.settings.rate });
+                    if (partial.pitch !== undefined) await db.settings.put({ key: 'tts_pitch', value: this.settings.pitch });
+                    if (partial.volume !== undefined) await db.settings.put({ key: 'tts_volume', value: this.settings.volume });
+                } catch (_) {}
+            },
+            async speak(text, opts = {}) {
+                if (!text) return;
+                const lang = opts.lang || 'pt-BR';
+                const rate = opts.rate ?? this.settings.rate ?? 1.1;
+                const pitch = opts.pitch ?? this.settings.pitch ?? 1.0;
+                const volume = opts.volume ?? this.settings.volume ?? 1.0;
+                try {
+                    if (this.mode === 'capacitor') {
+                        await window.Capacitor.Plugins.TextToSpeech.speak({
+                            text, lang, rate, pitch, volume, category: 'ambient'
+                        });
+                        return;
+                    }
+                    if (this.mode === 'cordova') {
+                        await new Promise((res, rej) => window.TTS.speak({ text, locale: lang, rate }, res, rej));
+                        return;
+                    }
+                } catch (_) {}
+                if ('speechSynthesis' in window) {
+                    window.speechSynthesis.cancel();
+                    const u = new SpeechSynthesisUtterance(text);
+                    u.lang = lang;
+                    u.rate = rate;
+                    u.pitch = pitch;
+                    u.volume = volume;
+                    if (TTS_STATE.voice) u.voice = TTS_STATE.voice;
+                    try { window.speechSynthesis.speak(u); } catch (_) {}
+                }
+            },
+            stop() {
+                try {
+                    if (this.mode === 'capacitor' && window.Capacitor?.Plugins?.TextToSpeech?.stop) {
+                        window.Capacitor.Plugins.TextToSpeech.stop();
+                        return;
+                    }
+                    if (this.mode === 'cordova' && window.TTS?.stop) {
+                        window.TTS.stop();
+                        return;
+                    }
+                } catch (_) {}
+                if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+            }
+        };
+        
+        function setupTTS() {
+            if (!('speechSynthesis' in window)) return false;
+            const pick = () => {
+                const voices = window.speechSynthesis.getVoices();
+                if (!voices || voices.length === 0) return;
+                TTS_STATE.voice = voices.find(v => v.lang && (v.lang.toLowerCase().startsWith('pt-br') || v.lang.toLowerCase().startsWith('pt'))) || voices[0] || null;
+                TTS_STATE.ready = !!TTS_STATE.voice;
+            };
+            pick();
+            if (!TTS_STATE.ready) {
+                window.speechSynthesis.onvoiceschanged = () => {
+                    pick();
+                };
+            }
+            return true;
+        }
+        
         // Initialize database with sample data if empty
         async function initializeDatabase() {
             try {
@@ -1492,22 +1732,41 @@
         
         async function initializeSupabase() {
             try {
+                await enqueueSupabaseAuth(async () => {
+                    try {
+                        const stored = await db.settings.get('supabase_session');
+                        const tokens = stored?.value;
+                        const { data: { session } } = await supabaseClient.auth.getSession();
+                        if (!session && tokens?.refresh_token && tokens?.access_token) {
+                            await supabaseClient.auth.setSession(tokens);
+                        }
+                    } catch (e) {}
+                });
+
                 // Subscribe to auth changes
                 supabaseClient.auth.onAuthStateChange(async (event, session) => {
                     const user = session?.user;
                     const header = document.querySelector('header');
                     const nav = document.querySelector('nav');
                     
+                    try {
+                        if (session?.access_token && session?.refresh_token) {
+                            await db.settings.put({ key: 'supabase_session', value: { access_token: session.access_token, refresh_token: session.refresh_token } });
+                        } else {
+                            await db.settings.delete('supabase_session');
+                        }
+                    } catch (e) {}
+
                     if (user) {
                         try {
                             let profile = null;
                             let role = null;
                             let displayName = user.email || 'Usuário';
-                            let needsRoleSelection = false;
 
                             // 1. Tentar buscar perfil do Supabase (Online)
                             if (navigator.onLine) {
                                 try {
+                                    const localUser = await db.users.get(user.id);
                                     const { data, error } = await supabaseClient
                                         .from('users')
                                         .select('*')
@@ -1515,9 +1774,17 @@
                                         .single();
                                     
                                     if (!error && data) {
-                                        profile = data;
-                                        // Cachear perfil no Dexie para uso offline
-                                        await db.users.put(snakeToCamel(profile));
+                                        if (localUser?.profileCompleted && !data.profile_completed) {
+                                            profile = localUser;
+                                            const syncData = camelToSnake(localUser);
+                                            syncData.profile_completed = true;
+                                            delete syncData.profileCompleted;
+                                            addToSyncQueue('update', 'users', user.id, syncData);
+                                        } else {
+                                            profile = data;
+                                            // Cachear perfil no Dexie para uso offline
+                                            await db.users.put(snakeToCamel(profile));
+                                        }
                                     }
                                 } catch (e) {
                                     console.warn('Erro ao buscar perfil online:', e);
@@ -1555,39 +1822,26 @@
                             }
                             
                             if (profile) {
-                                // Normalizar acesso a propriedades (camelCase vs snake_case)
                                 const userRole = profile.role;
                                 const userName = profile.name;
                                 const userMatricula = profile.matricula;
                                 const userUsina = profile.usina;
-                                // Dexie: profileCompleted, Supabase: profile_completed
-                                const isProfileCompleted = profile.profileCompleted !== undefined ? profile.profileCompleted : profile.profile_completed;
-                                
-                                const hasRole = !!userRole;
-                                const hasProfile = !!(userName && userMatricula && userUsina);
-                                
-                                if (hasRole && !role) {
-                                    role = userRole;
-                                }
-                                
-                                if ((!hasRole && !role) || !hasProfile || isProfileCompleted === false) {
-                                    needsRoleSelection = true;
-                                }
-                                
-                                if (role === 'admin') needsRoleSelection = false;
                                 if (userName) displayName = userName;
+                                if (!role) role = userRole || 'driver';
                             } else if (navigator.onLine) {
-                                // Create initial profile only if online
                                 try {
-                                    await supabaseClient.from('users').insert({
+                                    const initial = {
                                         id: user.id,
                                         email: user.email,
-                                        created_at: new Date().toISOString()
-                                    });
-                                    needsRoleSelection = true;
+                                        role: role || 'driver',
+                                        profile_completed: false
+                                    };
+                                    await supabaseClient.from('users').upsert(initial, { onConflict: 'id' });
+                                    await db.users.put(snakeToCamel(initial));
                                 } catch (e) { console.error("Erro ao criar perfil inicial:", e); }
                             }
                             
+                            if (!role) role = 'driver';
                             AppState.currentUser = {
                                 name: displayName,
                                 email: user.email || null,
@@ -1595,30 +1849,22 @@
                             };
                             
                             updateUserHeader();
-                            
-                            if (needsRoleSelection || !role) {
-                                if (header) header.style.display = 'none';
-                                if (nav) nav.style.display = 'none';
-                                showRoleSelectionModal();
+
+                            applyRolePermissions();
+                            if (header) header.style.display = 'block';
+                            if (nav) nav.style.display = 'block';
+                            if (isDriverRole(role)) {
+                                showView('driver', { replace: true });
                             } else {
-                                applyRolePermissions();
-                                if (header) header.style.display = 'block';
-                                if (nav) nav.style.display = 'block';
-                                if (isDriverRole(role)) {
-                                    showView('driver', { replace: true });
-                                } else {
-                                    showView('dashboard', { replace: true });
-                                }
-                                
-                                // Inicia a sincronização em background logo após mostrar a view inicial
-                                // Não usamos await aqui para liberar o fluxo da UI imediatamente
-                                syncAllFromSupabase().catch(e => console.error('Erro na sincronização inicial:', e));
-                                
-                                setupSupabaseListeners();
-                                processSyncQueue();
-                                if (window.syncInterval) clearInterval(window.syncInterval);
-                                window.syncInterval = setInterval(processSyncQueue, 30000);
+                                showView('dashboard', { replace: true });
                             }
+                            
+                            syncAllFromSupabase().catch(e => console.error('Erro na sincronização inicial:', e));
+                            
+                            setupSupabaseListeners();
+                            processSyncQueue();
+                            if (window.syncInterval) clearInterval(window.syncInterval);
+                            window.syncInterval = setInterval(processSyncQueue, 30000);
                         } catch (e) {
                             console.error('Erro ao carregar perfil do usuário:', e);
                             if (header) header.style.display = 'none';
@@ -1655,14 +1901,51 @@
             
             try {
                 if (isRegistering) {
-                    const { data, error } = await supabaseClient.auth.signUp({
+                    const name = (document.getElementById('register-name')?.value || '').trim();
+                    const matricula = (document.getElementById('register-matricula')?.value || '').trim();
+                    const cnh = (document.getElementById('register-cnh')?.value || '').trim();
+                    const usina = document.getElementById('register-usina')?.value || '';
+                    const role = document.getElementById('register-role')?.value || '';
+                    
+                    if (!name || !matricula || !usina || !role) {
+                        throw new Error('Preencha nome, matrícula, usina e perfil para cadastrar.');
+                    }
+                    
+                    const { data, error } = await signUpSafe({
                         email,
                         password,
                     });
                     if (error) throw error;
-                    showToast('Conta criada! Verifique seu e-mail.', 'success');
+                    
+                    const user = data?.user;
+                    const session = data?.session;
+                    if (!user || !session) {
+                        showToast('Conta criada! Faça login para continuar.', 'success');
+                        isRegistering = false;
+                        renderLoginView();
+                        return;
+                    }
+                    
+                    const profileRow = {
+                        id: user.id,
+                        email: user.email,
+                        role,
+                        name,
+                        matricula,
+                        cnh: cnh || null,
+                        usina,
+                        profile_completed: true
+                    };
+                    
+                    const { error: profileError } = await supabaseClient
+                        .from('users')
+                        .upsert(profileRow, { onConflict: 'id' });
+                    if (profileError) throw profileError;
+                    
+                    await db.users.put(snakeToCamel(profileRow));
+                    showToast('Conta criada com sucesso!', 'success');
                 } else {
-                    const { data, error } = await supabaseClient.auth.signInWithPassword({
+                    const { data, error } = await signInWithPasswordSafe({
                         email,
                         password,
                     });
@@ -1683,7 +1966,7 @@
         }
         
         function logout() {
-            supabaseClient.auth.signOut().then(() => {
+            signOutSafe().then(() => {
                 showToast('Desconectado.', 'info');
             }).catch((error) => {
                 console.error('Logout error:', error);
@@ -1696,18 +1979,48 @@
             const subtitle = document.querySelector('#view-login p');
             const btnText = document.getElementById('authButtonText');
             const toggleLink = document.getElementById('toggleAuthMode');
+            const registerFields = document.getElementById('register-fields');
             
             if (isRegistering) {
                 title.textContent = 'Criar Conta';
                 subtitle.textContent = 'Preencha os dados para se cadastrar';
                 btnText.textContent = 'Cadastrar';
                 toggleLink.textContent = 'Já tem uma conta? Entrar';
+                if (registerFields) registerFields.classList.remove('hidden');
             } else {
-                title.textContent = 'AgroRota';
+                title.textContent = 'HarvestManager';
                 subtitle.textContent = 'Faça login para acessar o sistema';
                 btnText.textContent = 'Entrar';
                 toggleLink.textContent = 'Criar nova conta';
+                if (registerFields) registerFields.classList.add('hidden');
             }
+        }
+
+        function setupBackButtonHandler() {
+            const handler = () => {
+                const modalContainer = document.getElementById('modal-container');
+                if (modalContainer && !modalContainer.classList.contains('hidden')) {
+                    hideModal();
+                    return;
+                }
+                const role = AppState.currentUser && AppState.currentUser.role ? AppState.currentUser.role : 'leader';
+                const rootView = isDriverRole(role) ? 'driver' : 'dashboard';
+                if (AppState.currentView && AppState.currentView !== rootView) {
+                    showView(rootView, { replace: true, noAnimation: true });
+                    return;
+                }
+            };
+            
+            try {
+                if (window.Capacitor?.Plugins?.App?.addListener) {
+                    window.Capacitor.Plugins.App.addListener('backButton', handler);
+                }
+            } catch (e) {}
+            
+            document.addEventListener('backbutton', (e) => {
+                e.preventDefault();
+                handler();
+            }, false);
         }
         
         // Generate a sample path for demo purposes with improved variation
@@ -1818,8 +2131,6 @@
             // Setup online/offline monitoring immediately
             setupOnlineStatusMonitoring();
             
-            initializeSupabase();
-            
             // Check and set initial online status
             if (!navigator.onLine) {
                 handleOfflineStatus();
@@ -1828,6 +2139,8 @@
             // Setup dark mode before any UI is shown
             setupDarkModeToggle();
             setupUserMenu();
+            setupTTS();
+            TTS.init().then(() => TTS.loadSettings());
             
             // Wait for all dependencies to be ready
             initAppAfterDependencies();
@@ -1840,6 +2153,10 @@
                 
                 // Initialize database
                 const dbInitialized = await initializeDatabase();
+                if (dbInitialized) {
+                    initializeSupabase();
+                    setupBackButtonHandler();
+                }
                 
                 // Setup keyboard shortcuts
                 setupKeyboardShortcuts();
@@ -2093,88 +2410,6 @@
             ]);
         }
         
-        async function chooseUserRole(role) {
-            try {
-                const { data: { user } } = await supabaseClient.auth.getUser();
-                if (!user) {
-                    showToast('Usuário não autenticado.', 'error');
-                    return;
-                }
-                
-                const nameInput = document.getElementById('profile-name');
-                const matriculaInput = document.getElementById('profile-matricula');
-                const cnhInput = document.getElementById('profile-cnh');
-                const usinaSelect = document.getElementById('profile-usina');
-                
-                const name = nameInput ? nameInput.value.trim() : '';
-                const matricula = matriculaInput ? matriculaInput.value.trim() : '';
-                const cnh = cnhInput ? cnhInput.value.trim() : '';
-                const usina = usinaSelect ? usinaSelect.value : '';
-                
-                if (!name || !matricula || !usina) {
-                    showToast('Preencha nome, matrícula e usina para finalizar o cadastro.', 'error');
-                    return;
-                }
-                
-                const userData = {
-                    id: user.id,
-                    role: role,
-                    name: name,
-                    matricula: matricula,
-                    cnh: cnh || null,
-                    usina: usina,
-                    profileCompleted: true, // CamelCase for Dexie
-                    email: user.email,
-                    createdAt: new Date().toISOString()
-                };
-
-                // 1. Salvar no Dexie (Offline First)
-                await db.users.put(userData);
-
-                // 2. Adicionar à fila de sync para garantir envio ao Supabase
-                const syncData = { ...userData };
-                // Converter para snake_case para o Supabase
-                syncData.profile_completed = true;
-                delete syncData.profileCompleted;
-                delete syncData.createdAt; // Supabase usa created_at, mas geralmente é readonly ou default
-                
-                await addToSyncQueue('users', 'update', user.id, syncData);
-                
-                // 3. Tentar enviar imediatamente se online (via processSyncQueue)
-                if (navigator.onLine) {
-                    processSyncQueue();
-                }
-                
-                AppState.currentUser = AppState.currentUser || {};
-                AppState.currentUser.role = role;
-                AppState.currentUser.name = name;
-                
-                applyRolePermissions();
-                updateUserHeader();
-                
-                const header = document.querySelector('header');
-                const nav = document.querySelector('nav');
-                if (header) header.style.display = 'block';
-                if (nav) nav.style.display = 'block';
-                
-                hideModal();
-                
-                if (isDriverRole(role)) {
-                    showView('driver', { replace: true });
-                } else {
-                    showView('dashboard', { replace: true });
-                }
-                
-                setupSupabaseListeners();
-                processSyncQueue();
-                if (window.syncInterval) clearInterval(window.syncInterval);
-                window.syncInterval = setInterval(processSyncQueue, 30000);
-            } catch (error) {
-                console.error('Erro ao salvar perfil do usuário:', error);
-                showToast('Erro ao salvar perfil. Tente novamente.', 'error');
-            }
-        }
-
         async function refreshDashboard() {
             if (navigator.onLine) {
                 showToast('Sincronizando dados...', 'info');
@@ -2191,87 +2426,6 @@
                 showToast('Você está offline. Exibindo dados locais.', 'warning');
                 renderDashboardView();
             }
-        }
-        
-        function showRoleSelectionModal() {
-            const content = `
-                <div class="space-y-6">
-                    <p class="text-gray-700 dark:text-gray-300 text-sm">
-                        Finalize seu cadastro preenchendo os dados abaixo e selecione seu perfil de acesso.
-                    </p>
-                    
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div>
-                            <label for="profile-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Nome completo</label>
-                            <input id="profile-name" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" placeholder="Digite seu nome" />
-                        </div>
-                        <div>
-                            <label for="profile-matricula" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Matrícula</label>
-                            <input id="profile-matricula" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" placeholder="Código ou número de matrícula" />
-                        </div>
-                        <div>
-                            <label for="profile-cnh" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">CNH (se tiver)</label>
-                            <input id="profile-cnh" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" placeholder="Número da CNH (opcional)" />
-                        </div>
-                        <div>
-                            <label for="profile-usina" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Usina</label>
-                            <select id="profile-usina" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm">
-                                <option value="">Selecione a usina</option>
-                                <option value="Usina Cambui">Usina Cambui</option>
-                                <option value="Usina Floresta">Usina Floresta</option>
-                                <option value="Usina Vale do Verdão">Usina Vale do Verdão</option>
-                                <option value="Usina Panorama">Usina Panorama</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="mt-4">
-                        <p class="text-gray-700 dark:text-gray-300 text-sm mb-3">
-                            Agora selecione o que você será dentro do sistema:
-                        </p>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <button onclick="chooseUserRole('driver')" class="w-full p-4 border border-gray-300 dark:border-gray-600 rounded-lg flex items-center space-x-3 hover:border-primary-500 hover:bg-primary-50 dark:hover:bg-gray-700 transition">
-                                <div class="w-10 h-10 rounded-full bg-primary-100 dark:bg-primary-900 flex items-center justify-center text-primary-600 dark:text-primary-300">
-                                    <i class="fas fa-truck"></i>
-                                </div>
-                                <div class="text-left">
-                                    <div class="font-semibold text-gray-900 dark:text-white">Motorista</div>
-                                    <div class="text-xs text-gray-600 dark:text-gray-400">Apenas Modo Motorista e rotas disponíveis.</div>
-                                </div>
-                            </button>
-                            <button onclick="chooseUserRole('controller')" class="w-full p-4 border border-gray-300 dark:border-gray-600 rounded-lg flex items-center space-x-3 hover:border-primary-500 hover:bg-primary-50 dark:hover:bg-gray-700 transition">
-                                <div class="w-10 h-10 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center text-blue-600 dark:text-blue-300">
-                                    <i class="fas fa-clipboard-list"></i>
-                                </div>
-                                <div class="text-left">
-                                    <div class="font-semibold text-gray-900 dark:text-white">Controle</div>
-                                    <div class="text-xs text-gray-600 dark:text-gray-400">Acesso completo às informações e relatórios.</div>
-                                </div>
-                            </button>
-                            <button onclick="chooseUserRole('leader')" class="w-full p-4 border border-gray-300 dark:border-gray-600 rounded-lg flex items-center space-x-3 hover:border-primary-500 hover:bg-primary-50 dark:hover:bg-gray-700 transition">
-                                <div class="w-10 h-10 rounded-full bg-green-100 dark:bg-green-900 flex items-center justify-center text-green-600 dark:text-green-300">
-                                    <i class="fas fa-user-tie"></i>
-                                </div>
-                                <div class="text-left">
-                                    <div class="font-semibold text-gray-900 dark:text-white">Líder</div>
-                                    <div class="text-xs text-gray-600 dark:text-gray-400">Configuração e gestão geral do sistema.</div>
-                                </div>
-                            </button>
-                            <button onclick="chooseUserRole('supervisor')" class="w-full p-4 border border-gray-300 dark:border-gray-600 rounded-lg flex items-center space-x-3 hover:border-primary-500 hover:bg-primary-50 dark:hover:bg-gray-700 transition">
-                                <div class="w-10 h-10 rounded-full bg-purple-100 dark:bg-purple-900 flex items-center justify-center text-purple-600 dark:text-purple-300">
-                                    <i class="fas fa-user-check"></i>
-                                </div>
-                                <div class="text-left">
-                                    <div class="font-semibold text-gray-900 dark:text-white">Supervisor</div>
-                                    <div class="text-xs text-gray-600 dark:text-gray-400">Acesso completo para acompanhamento das operações.</div>
-                                </div>
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            `;
-            
-            showModal('Finalize seu cadastro', content, []);
         }
         
         // ==========================================
@@ -2300,6 +2454,7 @@
             
             (async () => {
                 try {
+                    try { await db.open(); } catch (e) {}
                     const appView = document.getElementById('app-view');
                     if (options.params) {
                         Object.keys(options.params).forEach(key => {
@@ -2414,6 +2569,43 @@
                                     <input id="password" name="password" type="password" autocomplete="current-password" required class="appearance-none rounded-lg relative block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 placeholder-gray-500 text-gray-900 dark:text-white dark:bg-gray-700 focus:outline-none focus:ring-primary-500 focus:border-primary-500 focus:z-10 sm:text-sm" placeholder="********">
                                 </div>
                             </div>
+                            
+                            <div id="register-fields" class="hidden space-y-4">
+                                <div class="grid grid-cols-1 gap-4">
+                                    <div>
+                                        <label for="register-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Nome completo</label>
+                                        <input id="register-name" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" placeholder="Digite seu nome" />
+                                    </div>
+                                    <div>
+                                        <label for="register-matricula" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Matrícula</label>
+                                        <input id="register-matricula" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" placeholder="Código ou número de matrícula" />
+                                    </div>
+                                    <div>
+                                        <label for="register-cnh" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">CNH (se tiver)</label>
+                                        <input id="register-cnh" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" placeholder="Número da CNH (opcional)" />
+                                    </div>
+                                    <div>
+                                        <label for="register-usina" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Usina</label>
+                                        <select id="register-usina" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm">
+                                            <option value="">Selecione a usina</option>
+                                            <option value="Usina Cambui">Usina Cambui</option>
+                                            <option value="Usina Floresta">Usina Floresta</option>
+                                            <option value="Usina Vale do Verdão">Usina Vale do Verdão</option>
+                                            <option value="Usina Panorama">Usina Panorama</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label for="register-role" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Perfil</label>
+                                        <select id="register-role" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm">
+                                            <option value="">Selecione o perfil</option>
+                                            <option value="driver">Motorista</option>
+                                            <option value="controller">Controle</option>
+                                            <option value="leader">Líder</option>
+                                            <option value="supervisor">Supervisor</option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
 
                             <div class="flex items-center justify-between">
                                 <div class="text-sm">
@@ -2452,7 +2644,7 @@
 
         async function renderWelcomeView() {
             // Se não estiver logado, redireciona para login
-            const { data: { session } } = await supabaseClient.auth.getSession();
+            const { data: { session } } = await getSessionSafe();
             if (!session) {
                 renderLoginView();
                 return;
@@ -2554,15 +2746,16 @@
                     });
                 });
                 
-                // Add system users with driver role if not already present
                 systemUsers.forEach(u => {
-                    if (u.role === 'driver' && u.name) {
-                        const key = u.name.toLowerCase();
+                    const role = normalizeRole(u.role);
+                    if (role === 'driver') {
+                        const displayName = getUserDisplayName(u);
+                        const key = String((u.email || u.id || displayName) || '').toLowerCase();
                         if (!combinedDriversMap.has(key)) {
                             combinedDriversMap.set(key, {
-                                name: u.name,
-                                status: 'active', // System users are active by default if they can login
-                                assignedFront: null, // System users don't have assignedFront in users table yet
+                                name: displayName,
+                                status: 'active',
+                                assignedFront: null,
                                 type: 'user'
                             });
                         }
@@ -5392,9 +5585,26 @@
         
         async function renderDriverView() {
             try {
-                const routes = await db.routes.toArray();
-                const harvestFronts = await db.harvestFronts.toArray();
-                const drivers = await db.drivers.toArray();
+                let routes = await db.routes.toArray();
+                let harvestFronts = await db.harvestFronts.toArray();
+                let drivers = await db.drivers.toArray();
+                
+                if ((routes.length === 0 || harvestFronts.length === 0) && navigator.onLine) {
+                    try {
+                        const { data: { session } } = await getSessionSafe();
+                        if (session) {
+                            showToast('Sincronizando dados...', 'info');
+                            window.__suppressSyncViewRefresh = true;
+                            await syncAllFromSupabase();
+                            window.__suppressSyncViewRefresh = false;
+                            routes = await db.routes.toArray();
+                            harvestFronts = await db.harvestFronts.toArray();
+                            drivers = await db.drivers.toArray();
+                        }
+                    } catch (e) {
+                        window.__suppressSyncViewRefresh = false;
+                    }
+                }
                 
                 // Process route paths for any that might be compressed
                 routes.forEach(route => {
@@ -5454,8 +5664,13 @@
                                                             ${front ? `<div class="w-3 h-3 rounded-full mr-2" style="background-color: ${front.color}"></div>` : ''}
                                                             <h4 class="font-medium">${route.name || `Rota #${route.id}`}</h4>
                                                         </div>
-                                                        <div class="text-sm text-gray-500 dark:text-gray-400">
-                                                            ${startDate.toLocaleDateString()}
+                                                        <div class="flex items-center space-x-2">
+                                                            <button onclick="event.stopPropagation(); previewDriverRoute(${route.id})" class="text-xs px-2 py-1 rounded bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-600">
+                                                                Prévia
+                                                            </button>
+                                                            <div class="text-sm text-gray-500 dark:text-gray-400">
+                                                                ${startDate.toLocaleDateString()}
+                                                            </div>
                                                         </div>
                                                     </div>
                                                     <div class="mt-2 flex justify-between items-center">
@@ -5508,6 +5723,13 @@
                             </div>
                             
                             <div>
+                                <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-4 mb-6">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <h3 class="font-medium">Prévia da Rota</h3>
+                                        <div id="driver-preview-title" class="text-xs text-gray-500 dark:text-gray-400 truncate max-w-[60%]"></div>
+                                    </div>
+                                    <div id="driver-preview-map" class="w-full h-56 rounded-lg overflow-hidden bg-gray-200 dark:bg-gray-700"></div>
+                                </div>
                                 <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-5 mb-6">
                                     <h3 class="font-medium mb-3">Informações para Motoristas</h3>
                                     <div class="space-y-3 text-gray-600 dark:text-gray-300">
@@ -5606,6 +5828,15 @@
                         });
                     }
                 }
+
+                setTimeout(() => {
+                    try {
+                        initDriverPreviewMap();
+                        if (activeRoutes.length > 0) {
+                            previewDriverRoute(activeRoutes[0].id);
+                        }
+                    } catch (e) {}
+                }, 50);
                 
             } catch (error) {
                 console.error('Erro ao renderizar visão do motorista:', error);
@@ -5674,6 +5905,9 @@
                                 <button onclick="toggleVoiceNavigation()" id="voice-toggle-btn" class="p-2 rounded-full bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 focus:outline-none" title="Ativar/Desativar Voz">
                                     <i class="fas fa-volume-up"></i>
                                 </button>
+                                <button onclick="openVoiceSettingsModal()" id="voice-settings-btn" class="ml-2 p-2 rounded-full bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 focus:outline-none" title="Configurações de Voz">
+                                    <i class="fas fa-cog"></i>
+                                </button>
                             </div>
                         </div>
                         
@@ -5700,7 +5934,7 @@
                             </div>
                         </div>
                         
-                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
+                        <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mt-3">
                             <button id="start-navigation-btn" onclick="startNavigation()" class="px-4 py-3 bg-green-500 hover:bg-green-600 text-white rounded-lg flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2">
                                 <i class="fas fa-play mr-2"></i> Iniciar Navegação
                             </button>
@@ -5710,6 +5944,17 @@
                             <button id="center-map-nav-btn" onclick="centerMapOnUserLocation()" class="px-4 py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-lg flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2">
                                 <i class="fas fa-crosshairs mr-2"></i> Centralizar Mapa
                             </button>
+                            <button id="test-tts-btn" onclick="testTTS()" class="px-4 py-3 bg-purple-600 hover:bg-purple-700 text-white rounded-lg flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2">
+                                <i class="fas fa-volume-up mr-2"></i> Teste de Voz
+                            </button>
+                        </div>
+                        
+                        <div class="mt-3 flex items-center space-x-2">
+                            <label class="flex items-center space-x-2">
+                                <input id="preload-tiles-toggle" type="checkbox" class="form-checkbox h-4 w-4">
+                                <span class="text-sm text-gray-600 dark:text-gray-300">Pré-carregar mapa desta rota</span>
+                            </label>
+                            <span id="preload-status" class="text-xs text-gray-500 dark:text-gray-400"></span>
                         </div>
                         
                         <!-- Navigation alert container -->
@@ -5734,6 +5979,16 @@
                 setTimeout(() => {
                     initNavigationMap(route);
                 }, 100);
+                if (!TTS.available && !('speechSynthesis' in window)) {
+                    navigationState.voiceEnabled = false;
+                    const btn = document.getElementById('voice-toggle-btn');
+                    if (btn) {
+                        btn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                        btn.classList.add('opacity-50', 'cursor-not-allowed');
+                    }
+                } else {
+                    TTS.init();
+                }
                 
                 // Listen for device orientation changes to resize map properly
                 window.addEventListener('resize', () => {
@@ -5754,6 +6009,74 @@
                 console.error('Erro ao iniciar navegação:', error);
                 showToast('Erro ao iniciar navegação: ' + error.message, 'error');
                 showView('driver');
+            }
+        }
+
+        function initDriverPreviewMap() {
+            if (window.__driverPreviewMap) return window.__driverPreviewMap;
+            const el = document.getElementById('driver-preview-map');
+            if (!el) return null;
+            
+            const map = L.map(el, {
+                zoomControl: true,
+                attributionControl: false,
+                zoomSnap: 0.5
+            }).setView([-17.8, -50.9], 12);
+            
+            const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; OpenStreetMap'
+            });
+            
+            const esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                maxZoom: 22,
+                maxNativeZoom: 17
+            });
+            
+            esri.addTo(map);
+            L.control.layers({ 'Satélite': esri, 'Estradas': osm }, null, { collapsed: true }).addTo(map);
+            
+            window.__driverPreviewMap = map;
+            window.__driverPreviewLayers = { polyline: null, start: null, end: null };
+            return map;
+        }
+        
+        async function previewDriverRoute(routeId) {
+            const map = initDriverPreviewMap();
+            if (!map) return;
+            const rId = routeId ? parseInt(routeId) : null;
+            if (rId === null || isNaN(rId)) return;
+            const route = await db.routes.get(rId);
+            if (!route) return;
+            if (route.path && route.path._compressed) {
+                route.path = decompressPathData(route.path);
+            }
+            const points = Array.isArray(route.path) ? route.path : [];
+            if (points.length < 2) return;
+            
+            const layers = window.__driverPreviewLayers || {};
+            if (layers.polyline) { try { map.removeLayer(layers.polyline); } catch (e) {} }
+            if (layers.start) { try { map.removeLayer(layers.start); } catch (e) {} }
+            if (layers.end) { try { map.removeLayer(layers.end); } catch (e) {} }
+            
+            const latLngs = points.map(p => [p.lat, p.lng]);
+            layers.polyline = L.polyline(latLngs, { color: '#1B4332', weight: 4, opacity: 0.95 });
+            layers.start = L.circleMarker(latLngs[0], { radius: 6, color: '#16a34a', weight: 2, fillColor: '#16a34a', fillOpacity: 1 });
+            layers.end = L.circleMarker(latLngs[latLngs.length - 1], { radius: 6, color: '#dc2626', weight: 2, fillColor: '#dc2626', fillOpacity: 1 });
+            
+            layers.polyline.addTo(map);
+            layers.start.addTo(map);
+            layers.end.addTo(map);
+            window.__driverPreviewLayers = layers;
+            
+            const bounds = layers.polyline.getBounds();
+            if (bounds && bounds.isValid()) {
+                map.fitBounds(bounds, { padding: [12, 12] });
+            }
+            
+            const titleEl = document.getElementById('driver-preview-title');
+            if (titleEl) {
+                titleEl.textContent = route.name || `Rota #${route.id}`;
             }
         }
         
@@ -5917,28 +6240,93 @@
                     btn.innerHTML = '<i class="fas fa-volume-mute"></i>';
                     btn.classList.add('text-red-500');
                     showToast('Orientação por voz desativada', 'info');
-                    window.speechSynthesis.cancel();
+                    TTS.stop();
                 }
             }
         }
 
         function speakInstruction(text) {
             if (!navigationState.voiceEnabled || !text) return;
-            
-            // Cancelar falas anteriores para não acumular
-            window.speechSynthesis.cancel();
-            
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.lang = 'pt-BR';
-            utterance.rate = 1.1; 
-            
-            window.speechSynthesis.speak(utterance);
+            TTS.speak(text, { lang: 'pt-BR' });
+        }
+
+        async function openVoiceSettingsModal() {
+            await TTS.loadSettings();
+            const content = document.createElement('div');
+            content.innerHTML = `
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm mb-1">Velocidade</label>
+                        <input id="tts-rate" type="range" min="0.7" max="1.5" step="0.05" value="${TTS.settings.rate}" class="w-full">
+                    </div>
+                    <div>
+                        <label class="block text-sm mb-1">Tom</label>
+                        <input id="tts-pitch" type="range" min="0.7" max="1.5" step="0.05" value="${TTS.settings.pitch}" class="w-full">
+                    </div>
+                    <div>
+                        <label class="block text-sm mb-1">Volume</label>
+                        <input id="tts-volume" type="range" min="0.2" max="1.0" step="0.05" value="${TTS.settings.volume}" class="w-full">
+                    </div>
+                    <button id="tts-preview" class="px-3 py-2 bg-blue-500 text-white rounded">Ouvir Prévia</button>
+                </div>
+            `;
+            showModal('Configurações de Voz', content, [
+                { text: 'Cancelar' },
+                { text: 'Salvar', primary: true, action: async () => {
+                    const newRate = Number(content.querySelector('#tts-rate').value);
+                    const newPitch = Number(content.querySelector('#tts-pitch').value);
+                    const newVolume = Number(content.querySelector('#tts-volume').value);
+                    await TTS.saveSettings({ rate: newRate, pitch: newPitch, volume: newVolume });
+                    speakInstruction('Configurações de voz salvas.');
+                }}
+            ]);
+            content.querySelector('#tts-preview').addEventListener('click', () => {
+                const newRate = Number(content.querySelector('#tts-rate').value);
+                const newPitch = Number(content.querySelector('#tts-pitch').value);
+                const newVolume = Number(content.querySelector('#tts-volume').value);
+                TTS.speak('Prévia de voz.', { rate: newRate, pitch: newPitch, volume: newVolume, lang: 'pt-BR' });
+            });
+        }
+
+        function testTTS() {
+            if (!navigationState.voiceEnabled) {
+                showToast('Voz desativada', 'warning');
+                return;
+            }
+            TTS.speak('Teste de voz. A navegação por voz está funcionando.', { lang: 'pt-BR', rate: 1.05 });
+        }
+
+        function formatInstruction(step) {
+            if (!step) return '';
+            const type = step.maneuver?.type || '';
+            const mod = step.maneuver?.modifier || '';
+            const name = step.name || '';
+            const onto = name ? ` em ${name}` : '';
+            const dir = mod === 'left' ? 'à esquerda' :
+                        mod === 'right' ? 'à direita' :
+                        mod === 'slight left' ? 'levemente à esquerda' :
+                        mod === 'slight right' ? 'levemente à direita' :
+                        mod === 'sharp left' ? 'acentuadamente à esquerda' :
+                        mod === 'sharp right' ? 'acentuadamente à direita' :
+                        mod === 'straight' ? 'em frente' : '';
+            if (type === 'depart') return 'Iniciando rota';
+            if (type === 'arrive') return 'Você chegou ao destino';
+            if (type === 'roundabout') return 'Entre na rotatória e siga a indicação';
+            if (type === 'merge') return `Entre na via${onto}`;
+            if (type === 'on ramp') return `Pegue a alça de acesso${onto}`;
+            if (type === 'off ramp') return `Saia da via${onto}`;
+            if (type === 'turn' || type === 'end of road') {
+                if (dir) return `Vire ${dir}${onto}`;
+                return `Vire${onto}`;
+            }
+            if (dir) return `Siga ${dir}${onto}`;
+            return `Siga${onto}`;
         }
 
         async function fetchRouteInstructions(startLat, startLng, endLat, endLng) {
             if (!navigator.onLine) return;
             
-            const url = `https://router.project-osrm.org/route/v1/driving/${startLng},${startLat};${endLng},${endLat}?steps=true&overview=false&language=pt`;
+            const url = `https://router.project-osrm.org/route/v1/driving/${startLng},${startLat};${endLng},${endLat}?steps=true&overview=false`;
             
             try {
                 const response = await fetch(url);
@@ -5946,14 +6334,11 @@
                 
                 if (data.routes && data.routes.length > 0) {
                     navigationState.instructions = data.routes[0].legs[0].steps;
-                    // Começamos do índice 1 porque o 0 é o ponto de partida (depart)
                     navigationState.currentInstructionIndex = 1; 
                     console.log("Instruções de navegação carregadas:", navigationState.instructions.length);
-                    
-                    // Falar a primeira instrução (saída)
                     if (navigationState.instructions.length > 0) {
                         const firstStep = navigationState.instructions[0];
-                        speakInstruction(`Iniciando rota. ${firstStep.maneuver.instruction}`);
+                        speakInstruction(`Iniciando rota. ${formatInstruction(firstStep)}`);
                     }
                 }
             } catch (e) {
@@ -5981,7 +6366,7 @@
             if (dist < 200 && dist > 150 && speed > 30) {
                  const preKey = `${key}-pre`;
                  if (navigationState.lastPreAlert !== preKey) {
-                     speakInstruction(`Em 200 metros, ${step.maneuver.instruction}`);
+                     speakInstruction(`Em 200 metros, ${formatInstruction(step)}`);
                      navigationState.lastPreAlert = preKey;
                  }
             }
@@ -5989,7 +6374,7 @@
             // Aviso de execução (50m)
             if (dist < 50) {
                  if (navigationState.lastSpokenInstructionIndex !== navigationState.currentInstructionIndex) {
-                     speakInstruction(step.maneuver.instruction);
+                     speakInstruction(formatInstruction(step));
                      navigationState.lastSpokenInstructionIndex = navigationState.currentInstructionIndex;
                      
                      // Preparar para o próximo passo após passar o ponto (delay simples ou esperar distância aumentar)
@@ -6007,6 +6392,41 @@
             }
         }
 
+        function getPositionWithFallback(options = {}) {
+            return new Promise((resolve, reject) => {
+                if (!navigator.geolocation) {
+                    reject(new Error('Geolocalização indisponível'));
+                    return;
+                }
+                let settled = false;
+                navigator.geolocation.getCurrentPosition((pos) => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(pos);
+                }, (err) => {
+                    if (settled) return;
+                    const start = Date.now();
+                    const watchId = navigator.geolocation.watchPosition((pos) => {
+                        if (settled) return;
+                        if (pos.coords && (!options.requiredAccuracy || pos.coords.accuracy <= options.requiredAccuracy)) {
+                            settled = true;
+                            navigator.geolocation.clearWatch(watchId);
+                            resolve(pos);
+                        } else if (Date.now() - start > (options.fallbackTimeout || 15000)) {
+                            settled = true;
+                            navigator.geolocation.clearWatch(watchId);
+                            resolve(pos);
+                        }
+                    }, (e) => {
+                        if (settled) return;
+                        settled = true;
+                        navigator.geolocation.clearWatch(watchId);
+                        reject(e);
+                    }, { enableHighAccuracy: true, maximumAge: options.maximumAge || 10000, timeout: options.fallbackTimeout || 20000 });
+                }, { enableHighAccuracy: true, maximumAge: options.maximumAge || 10000, timeout: options.timeout || 25000 });
+            });
+        }
+
         async function startNavigation() {
             if (!navigationState.route || !navigationState.map) {
                 showToast('Erro: Rota não disponível para navegação', 'error');
@@ -6014,9 +6434,45 @@
             }
             
             try {
+                // Criar sessão da rota (log para admin)
+                try {
+                    const route = navigationState.route;
+                    const sessionId = generateNumericID();
+                    const nowIso = new Date().toISOString();
+                    const driverId = AppState.currentUser?.email || AppState.currentUser?.name || 'desconhecido';
+                    const session = {
+                        id: sessionId,
+                        routeId: route.id,
+                        frontId: route.frontId || navigationState.frontId || null,
+                        farmId: route.farmId || null,
+                        driverId,
+                        startTime: nowIso,
+                        endTime: null,
+                        distanceKm: null,
+                        durationMin: null,
+                        status: 'active',
+                        createdAt: nowIso,
+                        updatedAt: nowIso
+                    };
+                    await db.routeSessions.put(session);
+                    addToSyncQueue('create', 'routeSessions', sessionId, session);
+                    navigationState.currentSessionId = sessionId;
+                } catch (e) { console.warn('Falha ao iniciar sessão de rota:', e); }
+
+                try {
+                    const preloadToggle = document.getElementById('preload-tiles-toggle');
+                    const shouldPreload = preloadToggle && preloadToggle.checked;
+                    if (shouldPreload && navigator.onLine) {
+                        const status = document.getElementById('preload-status');
+                        if (status) { status.textContent = 'Pré-carregando mapa...'; }
+                        await preloadRouteTiles(navigationState.map, navigationState.route.path);
+                        if (status) { status.textContent = 'Mapa pré-carregado.'; }
+                    }
+                } catch (e) { console.warn('Pré-carregamento de tiles falhou:', e); }
                 // Update UI
                 document.getElementById('start-navigation-btn').disabled = true;
                 document.getElementById('stop-navigation-btn').disabled = false;
+                
                 
                 // --- Recalcular rota se não estiver na Usina Cambuí ---
                 const USINA_CAMBUI_LOCATION = { lat: -17.924714302556936, lng: -50.63708775318097 };
@@ -6024,12 +6480,7 @@
                 if (navigator.geolocation) {
                     showLoading('Validando ponto de partida...');
                     try {
-                        const position = await new Promise((resolve, reject) => {
-                            navigator.geolocation.getCurrentPosition(resolve, reject, { 
-                                enableHighAccuracy: true, 
-                                timeout: 10000 
-                            });
-                        });
+                        const position = await getPositionWithFallback({ timeout: 25000, fallbackTimeout: 20000, requiredAccuracy: 50, maximumAge: 10000 });
                         
                         const userLat = position.coords.latitude;
                         const userLng = position.coords.longitude;
@@ -6041,18 +6492,17 @@
                             showLoading('Recalculando rota da sua posição atual...');
                             
                             const destination = navigationState.route.path[navigationState.route.path.length - 1];
-                            const url = `https://router.project-osrm.org/route/v1/driving/${userLng},${userLat};${destination.lng},${destination.lat}?overview=full&geometries=geojson&steps=true&language=pt`;
+                            const url = `https://router.project-osrm.org/route/v1/driving/${userLng},${userLat};${destination.lng},${destination.lat}?overview=full&geometries=geojson&steps=true`;
                             
                             try {
                                 const response = await fetch(url);
                                 const data = await response.json();
                                 
                                 if (data.routes && data.routes.length > 0) {
-                                    // Salvar instruções se disponíveis
                                     if (data.routes[0].legs && data.routes[0].legs[0].steps) {
                                         navigationState.instructions = data.routes[0].legs[0].steps;
                                         navigationState.currentInstructionIndex = 1;
-                                        speakInstruction("Rota recalculada. " + (navigationState.instructions[0]?.maneuver?.instruction || ""));
+                                        speakInstruction("Rota recalculada. " + formatInstruction(navigationState.instructions[0]));
                                     }
 
                                     const newPath = data.routes[0].geometry.coordinates.map(c => ({
@@ -6171,6 +6621,44 @@
                 showToast('Erro ao iniciar navegação: ' + error.message, 'error');
                 stopNavigation();
             }
+        }
+        
+        function getActiveTileLayer(map) {
+            let found = null;
+            map.eachLayer(l => {
+                if (!found && l instanceof L.TileLayer) found = l;
+            });
+            return found;
+        }
+        
+        function latLngToTile(lat, lng, z) {
+            const x = Math.floor((lng + 180) / 360 * Math.pow(2, z));
+            const y = Math.floor((1 - Math.log(Math.tan(lat * Math.PI/180) + 1/Math.cos(lat * Math.PI/180)) / Math.PI) / 2 * Math.pow(2, z));
+            return { x, y, z };
+        }
+        
+        async function preloadRouteTiles(map, path, options = {}) {
+            const tileLayer = getActiveTileLayer(map);
+            if (!tileLayer) return;
+            const urlTemplate = tileLayer._url;
+            const subdomains = tileLayer.options.subdomains || ['a','b','c'];
+            const zooms = options.zooms || [15, 16, 17];
+            const sampleEvery = options.sampleEvery || Math.max(1, Math.floor(path.length / 50));
+            const requests = [];
+            for (let i = 0; i < path.length; i += sampleEvery) {
+                const p = path[i];
+                for (const z of zooms) {
+                    const { x, y } = latLngToTile(p.lat, p.lng, z);
+                    const s = subdomains[(x + y) % subdomains.length] || '';
+                    let url = urlTemplate
+                        .replace('{z}', z)
+                        .replace('{x}', x)
+                        .replace('{y}', y)
+                        .replace('{s}', s);
+                    try { requests.push(fetch(url, { mode: 'no-cors' }).catch(() => null)); } catch (_) {}
+                }
+            }
+            await Promise.allSettled(requests);
         }
         
         function updateNavigation(position) {
@@ -6590,6 +7078,46 @@
             // Set navigation as inactive
             navigationState.active = false;
             
+            // Finalizar sessão da rota (log para admin)
+            (async () => {
+                try {
+                    const sessionId = navigationState.currentSessionId;
+                    if (sessionId) {
+                        const session = await db.routeSessions.get(sessionId);
+                        if (session) {
+                            const endIso = new Date().toISOString();
+                            const route = navigationState.route;
+                            let distanceKm = 0;
+                            if (route?.distance) {
+                                distanceKm = Number(route.distance);
+                            } else if (route?.path && route.path.length > 1) {
+                                for (let i = 1; i < route.path.length; i++) {
+                                    const a = route.path[i - 1];
+                                    const b = route.path[i];
+                                    distanceKm += haversineDistance(a.lat, a.lng, b.lat, b.lng);
+                                }
+                            }
+                            const startMs = new Date(session.startTime).getTime();
+                            const endMs = new Date(endIso).getTime();
+                            const durationMin = Math.max(0, Math.round((endMs - startMs) / 60000));
+                            
+                            const updated = {
+                                ...session,
+                                endTime: endIso,
+                                distanceKm: Number(distanceKm.toFixed(2)),
+                                durationMin,
+                                status: 'completed',
+                                updatedAt: endIso
+                            };
+                            await db.routeSessions.put(updated);
+                            addToSyncQueue('update', 'routeSessions', sessionId, updated);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Falha ao finalizar sessão de rota:', e);
+                }
+            })();
+            
             // Allow screen to sleep again
             keepScreenOn(false);
             
@@ -6686,12 +7214,11 @@
                     db.users.toArray()
                 ]);
                 
-                // Combine physical drivers and system users with 'driver' role
                 const combinedDriversMap = new Map();
                 
-                // Add physical drivers first
                 drivers.forEach(d => {
-                    combinedDriversMap.set(d.name.toLowerCase(), {
+                    const key = String((d.name || d.id) || '').toLowerCase();
+                    combinedDriversMap.set(key, {
                         id: d.id,
                         name: d.name,
                         phone: d.phone,
@@ -6705,14 +7232,15 @@
                     });
                 });
                 
-                // Add system users with driver role if not already present
                 systemUsers.forEach(u => {
-                    if (u.role === 'driver' && u.name) {
-                        const key = u.name.toLowerCase();
+                    const role = normalizeRole(u.role);
+                    if (role === 'driver') {
+                        const displayName = getUserDisplayName(u);
+                        const key = String((u.email || u.id || displayName) || '').toLowerCase();
                         if (!combinedDriversMap.has(key)) {
                             combinedDriversMap.set(key, {
                                 id: u.id,
-                                name: u.name,
+                                name: displayName,
                                 phone: u.email || 'N/A',
                                 license: u.cnh || 'N/A',
                                 experience: 'Usuário do Sistema',
@@ -7376,14 +7904,29 @@
         
         async function renderReportsView() {
             try {
-                // Fetch data
-                const routes = await db.routes.toArray();
-                const harvestFronts = await db.harvestFronts.toArray();
-                const drivers = await db.drivers.toArray();
-                
-                // Fetch drivers from Firestore if user is leader or admin
-                let driverUsers = [];
                 const currentUserRole = AppState.currentUser ? AppState.currentUser.role : null;
+                
+                if ((currentUserRole === 'leader' || currentUserRole === 'admin') && navigator.onLine) {
+                    try {
+                        window.__suppressSyncViewRefresh = true;
+                        await processSyncQueue();
+                        await syncAllFromSupabase();
+                    } catch (e) {
+                    } finally {
+                        window.__suppressSyncViewRefresh = false;
+                    }
+                }
+                
+                const [routes, harvestFronts, farms, drivers, routeSessionsRaw] = await Promise.all([
+                    db.routes.toArray(),
+                    db.harvestFronts.toArray(),
+                    db.farms.toArray(),
+                    db.drivers.toArray(),
+                    db.routeSessions?.toArray ? db.routeSessions.toArray() : Promise.resolve([])
+                ]);
+                
+                let driverUsers = [];
+                let incompleteUsers = [];
                 
                 if (currentUserRole === 'leader' || currentUserRole === 'admin') {
                     try {
@@ -7395,6 +7938,17 @@
                         driverUsers = data || [];
                     } catch (e) {
                         console.error('Erro ao buscar motoristas:', e);
+                    }
+                    
+                    try {
+                        const { data, error } = await supabaseClient
+                            .from('users')
+                            .select('*')
+                            .or('profile_completed.is.null,profile_completed.eq.false,name.is.null,matricula.is.null,usina.is.null,role.is.null');
+                        if (error) throw error;
+                        incompleteUsers = (data || []).filter(u => (u.email || '').toLowerCase().trim() !== 'gutemberggg10@gmail.com');
+                    } catch (e) {
+                        console.error('Erro ao buscar usuários pendentes:', e);
                     }
                 }
                 
@@ -7434,6 +7988,11 @@
                                     <i class="fas fa-print mr-2"></i>
                                     Imprimir
                                 </button>
+                                ${(currentUserRole === 'leader' || currentUserRole === 'admin') ? `
+                                <button onclick="exportRouteSessions()" class="flex items-center px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                                    <i class="fas fa-file-csv mr-2"></i>
+                                    Exportar Sessões
+                                </button>` : ''}
                             </div>
                         </div>
                         
@@ -7676,6 +8235,61 @@
                         </div>
                         
                         ${(currentUserRole === 'leader' || currentUserRole === 'admin') ? `
+                        <!-- Route Sessions (Admin) -->
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden mb-6">
+                          <div class="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+                            <h3 class="font-medium">Sessões de Rotas (Motoristas)</h3>
+                            <div class="text-sm text-gray-500 dark:text-gray-400">
+                              ${routeSessionsRaw.length} sessão(ões)
+                            </div>
+                          </div>
+                          <div class="overflow-x-auto">
+                            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                              <thead class="bg-gray-50 dark:bg-gray-700">
+                                <tr>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Motorista</th>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Frente</th>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Fazenda</th>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Início</th>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Fim</th>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Duração</th>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Distância</th>
+                                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Status</th>
+                                </tr>
+                              </thead>
+                              <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                ${(() => {
+                                  const frontsMap = new Map(harvestFronts.map(f => [String(f.id), f]));
+                                  const farmsMap = new Map(farms.map(f => [String(f.id), f]));
+                                  const sessions = (routeSessionsRaw || []).slice().sort((a,b) => new Date(b.startTime) - new Date(a.startTime));
+                                  return sessions.map(s => {
+                                    const front = s.frontId ? frontsMap.get(String(s.frontId)) : null;
+                                    const farm = s.farmId ? farmsMap.get(String(s.farmId)) : null;
+                                    const startStr = s.startTime ? new Date(s.startTime).toLocaleString() : '-';
+                                    const endStr = s.endTime ? new Date(s.endTime).toLocaleString() : '-';
+                                    const durStr = s.durationMin != null ? minutesToHM(s.durationMin) : '-';
+                                    const distStr = s.distanceKm != null ? `${Number(s.distanceKm).toFixed(2)} km` : '-';
+                                    return `
+                                      <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm">${s.driverId || '-'}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm">${front?.name || '-'}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm">${farm?.name || '-'}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${startStr}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${endStr}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm">${durStr}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm">${distStr}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm">${s.status || '-'}</td>
+                                      </tr>
+                                    `;
+                                  }).join('');
+                                })()}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                        ` : ''}
+                        
+                        ${(currentUserRole === 'leader' || currentUserRole === 'admin') ? `
                         <!-- Drivers List Section -->
                         <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 mb-6">
                             <h3 class="text-lg font-semibold mb-4 border-b pb-2 dark:border-gray-700">Motoristas Cadastrados</h3>
@@ -7703,6 +8317,43 @@
                                             </tr>
                                         `).join('') : `
                                             <tr><td colspan="4" class="px-6 py-4 text-center text-gray-500">Nenhum motorista encontrado.</td></tr>
+                                        `}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        ` : ''}
+
+                        ${(currentUserRole === 'admin') ? `
+                        <!-- Incomplete Users (Admin) -->
+                        <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden mb-6">
+                            <div class="p-4 border-b border-gray-200 dark:border-gray-700">
+                                <h3 class="font-medium">Usuários Pendentes de Perfil</h3>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                    <thead class="bg-gray-50 dark:bg-gray-700">
+                                        <tr>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Email</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Nome</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Perfil</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Ação</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                        ${incompleteUsers.length > 0 ? incompleteUsers.map(u => `
+                                            <tr>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${u.email || '-'}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${u.name || '-'}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${u.role || '-'}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap">
+                                                    <button onclick="adminOpenUserProfileEditor('${u.id}')" class="px-3 py-1 bg-primary-500 hover:bg-primary-600 text-white rounded-md text-sm">
+                                                        Completar
+                                                    </button>
+                                                </td>
+                                            </tr>
+                                        `).join('') : `
+                                            <tr><td colspan="4" class="px-6 py-4 text-center text-gray-500">Nenhum usuário pendente.</td></tr>
                                         `}
                                     </tbody>
                                 </table>
@@ -8042,6 +8693,204 @@
             setTimeout(() => {
                 showToast('Relatórios exportados com sucesso!', 'success');
             }, 1500);
+        }
+        
+        function minutesToHM(min) {
+            const h = Math.floor(min / 60);
+            const m = min % 60;
+            return `${h}h ${m}min`;
+        }
+        
+        async function exportRouteSessions() {
+            try {
+                const [sessions, harvestFronts, farms] = await Promise.all([
+                    db.routeSessions?.toArray ? db.routeSessions.toArray() : Promise.resolve([]),
+                    db.harvestFronts.toArray(),
+                    db.farms.toArray()
+                ]);
+                const frontsMap = new Map(harvestFronts.map(f => [String(f.id), f.name]));
+                const farmsMap = new Map(farms.map(f => [String(f.id), f.name]));
+                const header = 'id,route_id,front,farm,driver_id,start_time,end_time,duration_min,distance_km,status\n';
+                const rows = (sessions || []).map(s => {
+                    const frontName = s.frontId ? (frontsMap.get(String(s.frontId)) || '') : '';
+                    const farmName = s.farmId ? (farmsMap.get(String(s.farmId)) || '') : '';
+                    return [
+                        s.id,
+                        s.routeId || '',
+                        `"${frontName.replace(/"/g,'""')}"`,
+                        `"${farmName.replace(/"/g,'""')}"`,
+                        `"${(s.driverId || '').replace(/"/g,'""')}"`,
+                        s.startTime || '',
+                        s.endTime || '',
+                        s.durationMin != null ? s.durationMin : '',
+                        s.distanceKm != null ? Number(s.distanceKm).toFixed(2) : '',
+                        s.status || ''
+                    ].join(',');
+                }).join('\n');
+                const csv = header + rows;
+                downloadFile(csv, `route_sessions_${new Date().toISOString().slice(0,10)}.csv`, 'text/csv');
+                showToast('Sessões exportadas', 'success');
+            } catch (e) {
+                console.error('Falha ao exportar sessões:', e);
+                showToast('Falha ao exportar sessões', 'error');
+            }
+        }
+
+        async function adminOpenUserProfileEditor(userId) {
+            try {
+                const id = String(userId || '').trim();
+                if (!id) return;
+                
+                let userRow = null;
+                
+                if (navigator.onLine) {
+                    try {
+                        const { data, error } = await enqueueSupabaseAuth(() => supabaseClient
+                            .from('users')
+                            .select('*')
+                            .eq('id', id)
+                            .single());
+                        if (!error && data) userRow = data;
+                    } catch (e) {}
+                }
+                
+                if (!userRow) {
+                    const local = await db.users.get(id);
+                    if (local) userRow = camelToSnake(local);
+                }
+                
+                if (!userRow) {
+                    showToast('Usuário não encontrado', 'error');
+                    return;
+                }
+                
+                const email = userRow.email || '';
+                const name = userRow.name || '';
+                const matricula = userRow.matricula || '';
+                const cnh = userRow.cnh || '';
+                const usina = userRow.usina || '';
+                const role = userRow.role || '';
+                
+                const content = `
+                    <div class="space-y-4">
+                        <div class="text-sm text-gray-600 dark:text-gray-300">${email}</div>
+                        <div>
+                            <label for="admin-user-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Nome completo</label>
+                            <input id="admin-user-name" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" value="${String(name).replace(/"/g, '&quot;')}" />
+                        </div>
+                        <div>
+                            <label for="admin-user-matricula" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Matrícula</label>
+                            <input id="admin-user-matricula" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" value="${String(matricula).replace(/"/g, '&quot;')}" />
+                        </div>
+                        <div>
+                            <label for="admin-user-cnh" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">CNH (se tiver)</label>
+                            <input id="admin-user-cnh" type="text" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" value="${String(cnh).replace(/"/g, '&quot;')}" />
+                        </div>
+                        <div>
+                            <label for="admin-user-usina" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Usina</label>
+                            <select id="admin-user-usina" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm">
+                                <option value="">Selecione a usina</option>
+                                <option value="Usina Cambui" ${usina === 'Usina Cambui' ? 'selected' : ''}>Usina Cambui</option>
+                                <option value="Usina Floresta" ${usina === 'Usina Floresta' ? 'selected' : ''}>Usina Floresta</option>
+                                <option value="Usina Vale do Verdão" ${usina === 'Usina Vale do Verdão' ? 'selected' : ''}>Usina Vale do Verdão</option>
+                                <option value="Usina Panorama" ${usina === 'Usina Panorama' ? 'selected' : ''}>Usina Panorama</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="admin-user-role" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Perfil</label>
+                            <select id="admin-user-role" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm">
+                                <option value="">Selecione o perfil</option>
+                                <option value="driver" ${role === 'driver' ? 'selected' : ''}>Motorista</option>
+                                <option value="controller" ${role === 'controller' ? 'selected' : ''}>Controle</option>
+                                <option value="leader" ${role === 'leader' ? 'selected' : ''}>Líder</option>
+                                <option value="supervisor" ${role === 'supervisor' ? 'selected' : ''}>Supervisor</option>
+                            </select>
+                        </div>
+                    </div>
+                `;
+                
+                showModal('Completar Perfil do Usuário', content, [
+                    {
+                        text: 'Cancelar',
+                        primary: false
+                    },
+                    {
+                        text: 'Salvar',
+                        primary: true,
+                        closeModal: false,
+                        action: async () => {
+                            const newName = (document.getElementById('admin-user-name')?.value || '').trim();
+                            const newMatricula = (document.getElementById('admin-user-matricula')?.value || '').trim();
+                            const newCnh = (document.getElementById('admin-user-cnh')?.value || '').trim();
+                            const newUsina = document.getElementById('admin-user-usina')?.value || '';
+                            const newRole = document.getElementById('admin-user-role')?.value || '';
+                            
+                            if (!newName || !newMatricula || !newUsina || !newRole) {
+                                showToast('Preencha nome, matrícula, usina e perfil.', 'error');
+                                return;
+                            }
+                            
+                            const payload = {
+                                id,
+                                email,
+                                role: newRole,
+                                name: newName,
+                                matricula: newMatricula,
+                                cnh: newCnh || null,
+                                usina: newUsina,
+                                profile_completed: true
+                            };
+                            
+                            try {
+                                await db.users.put({
+                                    ...snakeToCamel(payload),
+                                    profile_completed: true,
+                                    profileCompleted: true
+                                });
+                            } catch (e) {}
+                            
+                            await addToSyncQueue('update', 'users', id, payload);
+                            
+                            if (navigator.onLine) {
+                                try {
+                                    showLoading('Salvando no servidor...');
+                                    const { error } = await enqueueSupabaseAuth(() => supabaseClient
+                                        .from('users')
+                                        .upsert(payload, { onConflict: 'id' }));
+                                    if (error) throw error;
+                                    
+                                    try {
+                                        const queued = await db.syncQueue
+                                            .where('tableName')
+                                            .equals('users')
+                                            .toArray();
+                                        const toDelete = queued.filter(q => String(q.itemId) === String(id));
+                                        for (const q of toDelete) {
+                                            await db.syncQueue.delete(q.id);
+                                        }
+                                    } catch (e) {}
+                                    
+                                    await syncAllFromSupabase();
+                                } catch (e) {
+                                    console.error('Falha ao salvar usuário no servidor:', e);
+                                    showToast(`Não foi possível salvar no servidor: ${e.message || e}`, 'error');
+                                    hideLoading();
+                                    return;
+                                } finally {
+                                    hideLoading();
+                                }
+                            }
+                            
+                            hideModal();
+                            showToast('Perfil atualizado', 'success');
+                            showView('reports', { replace: true, noAnimation: true });
+                        }
+                    }
+                ]);
+            } catch (e) {
+                console.error('Erro ao abrir editor de perfil:', e);
+                showToast('Erro ao abrir editor de perfil', 'error');
+            }
         }
         
         // ==========================================
@@ -8852,12 +9701,16 @@
         // Base layers for maps
         const baseLayers = {
             "Mapa Padrão": L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
                 attribution: '&copy; OpenStreetMap contributors'
             }),
             "Satélite (Esri)": L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                maxZoom: 22,
+                maxNativeZoom: 17,
+                errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAOaZVxQAAAAASUVORK5CYII=',
                 attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
             }),
-            "Satélite (Google)": L.tileLayer('http://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+            "Satélite (Google)": L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
                 maxZoom: 20,
                 subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
                 attribution: '&copy; Google Maps'
@@ -8865,7 +9718,7 @@
         };
 
         function initMapWithLayers(mapId, center, zoom) {
-            const map = L.map(mapId).setView(center, zoom);
+            const map = L.map(mapId, { minZoom: 3, maxZoom: 22 }).setView(center, zoom);
             
             // Adicionar Esri Satellite como padrão
             if (baseLayers["Satélite (Esri)"]) {
@@ -10678,7 +11531,7 @@
                 <div class="fade-in">
                     <h2 class="text-2xl font-bold mb-6 text-gray-800 dark:text-white">Painel de Administração</h2>
                     
-                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden mb-6">
                         <div class="p-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
                             <h3 class="font-medium text-lg">Usuários Cadastrados</h3>
                             <button onclick="renderAdminView()" class="text-blue-600 hover:text-blue-800">
@@ -10693,10 +11546,38 @@
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Email</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Função</th>
                                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Status</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Ações</th>
                                     </tr>
                                 </thead>
                                 <tbody id="users-table-body" class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                                    <tr><td colspan="4" class="px-6 py-4 text-center">Carregando...</td></tr>
+                                    <tr><td colspan="5" class="px-6 py-4 text-center">Carregando...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
+                        <div class="p-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
+                            <h3 class="font-medium text-lg">Sessões de Rotas (Motoristas)</h3>
+                            <div class="text-sm text-gray-500 dark:text-gray-400" id="admin-sessions-count"></div>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                                <thead class="bg-gray-50 dark:bg-gray-700">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Motorista</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Rota</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Fazenda</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Frente</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Início</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Fim</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Min</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">KM</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="admin-sessions-body" class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                                    <tr><td colspan="9" class="px-6 py-4 text-center">Carregando...</td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -10705,6 +11586,17 @@
             `;
             
             try {
+                if (navigator.onLine) {
+                    try {
+                        window.__suppressSyncViewRefresh = true;
+                        await processSyncQueue();
+                        await syncAllFromSupabase();
+                    } catch (e) {
+                    } finally {
+                        window.__suppressSyncViewRefresh = false;
+                    }
+                }
+                
                 // Use local data first for speed
                 const users = await db.users.toArray();
                 
@@ -10712,12 +11604,13 @@
                 tbody.innerHTML = '';
                 
                 if (!users || users.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" class="px-6 py-4 text-center">Nenhum usuário encontrado no banco de dados local.</td></tr>';
-                    return;
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-4 text-center">Nenhum usuário encontrado no banco de dados local.</td></tr>';
                 }
                 
                 users.forEach(user => {
                     const isSelf = user.email === AppState.currentUser.email;
+                    const profileCompleted = user.profileCompleted !== undefined ? user.profileCompleted : user.profile_completed;
+                    const isIncomplete = !user.name || !user.matricula || !user.usina || !user.role || profileCompleted === false;
                     const tr = document.createElement('tr');
                     tr.innerHTML = `
                         <td class="px-6 py-4 whitespace-nowrap">
@@ -10738,26 +11631,90 @@
                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                             ${isSelf ? '<span class="text-xs italic text-blue-500">(Você)</span>' : '<span class="text-xs text-gray-400">Offline</span>'}
                         </td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            ${isIncomplete ? `
+                                <button onclick="adminOpenUserProfileEditor('${user.id}')" class="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-md text-sm">
+                                    Completar perfil
+                                </button>
+                            ` : '<span class="text-xs text-green-600">OK</span>'}
+                        </td>
                     `;
                     tbody.appendChild(tr);
                 });
                 
+                try {
+                    const [sessions, routes, fronts, farms] = await Promise.all([
+                        db.routeSessions?.toArray ? db.routeSessions.toArray() : Promise.resolve([]),
+                        db.routes.toArray(),
+                        db.harvestFronts.toArray(),
+                        db.farms.toArray()
+                    ]);
+                    const routesMap = new Map(routes.map(r => [String(r.id), r]));
+                    const frontsMap = new Map(fronts.map(f => [String(f.id), f]));
+                    const farmsMap = new Map(farms.map(f => [String(f.id), f]));
+                    const sorted = (sessions || []).slice().sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+                    const recent = sorted.slice(0, 50);
+                    
+                    const countEl = document.getElementById('admin-sessions-count');
+                    if (countEl) countEl.textContent = `${recent.length} de ${sorted.length}`;
+                    
+                    const sBody = document.getElementById('admin-sessions-body');
+                    if (sBody) {
+                        sBody.innerHTML = '';
+                        if (recent.length === 0) {
+                            sBody.innerHTML = '<tr><td colspan="9" class="px-6 py-4 text-center text-gray-500">Nenhuma sessão registrada ainda.</td></tr>';
+                        } else {
+                            recent.forEach(s => {
+                                const route = s.routeId ? routesMap.get(String(s.routeId)) : null;
+                                const frontId = s.frontId || route?.frontId || null;
+                                const farmId = s.farmId || route?.farmId || null;
+                                const front = frontId ? frontsMap.get(String(frontId)) : null;
+                                const farm = farmId ? farmsMap.get(String(farmId)) : null;
+                                const start = s.startTime ? new Date(s.startTime) : null;
+                                const end = s.endTime ? new Date(s.endTime) : null;
+                                const tr = document.createElement('tr');
+                                tr.innerHTML = `
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${s.driverId || '-'}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${route?.name || (s.routeId ? `Rota #${s.routeId}` : '-')}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${farm?.name || '-'}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${front?.name || '-'}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${start ? start.toLocaleString() : '-'}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${end ? end.toLocaleString() : '-'}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${s.durationMin != null ? s.durationMin : '-'}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">${s.distanceKm != null ? Number(s.distanceKm).toFixed(2) : '-'}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                                        <span class="status-badge ${getStatusClass(s.status || 'active')}">${getStatusText(s.status || 'active')}</span>
+                                    </td>
+                                `;
+                                sBody.appendChild(tr);
+                            });
+                        }
+                    }
+                } catch (e) {
+                    const sBody = document.getElementById('admin-sessions-body');
+                    if (sBody) sBody.innerHTML = `<tr><td colspan="9" class="px-6 py-4 text-center text-red-500">Erro ao carregar sessões</td></tr>`;
+                }
+                
             } catch (e) {
                 console.error('Erro ao listar usuários:', e);
                 const tbody = document.getElementById('users-table-body');
-                if (tbody) tbody.innerHTML = `<tr><td colspan="4" class="px-6 py-4 text-center text-red-500">Erro ao carregar: ${e.message}</td></tr>`;
+                if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="px-6 py-4 text-center text-red-500">Erro ao carregar: ${e.message}</td></tr>`;
             }
         }
         
         async function updateUserRole(userId, newRole) {
             try {
                 showLoading('Atualizando permissão...');
-                const { error } = await supabaseClient
-                    .from('users')
-                    .update({ role: newRole })
-                    .eq('id', userId);
+                try {
+                    await db.users.update(userId, { role: newRole });
+                } catch (e) {}
                 
-                if (error) throw error;
+                await addToSyncQueue('update', 'users', userId, { id: userId, role: newRole });
+                
+                if (navigator.onLine) {
+                    await processSyncQueue();
+                    await syncAllFromSupabase();
+                }
                 
                 hideLoading();
                 showToast('Permissão atualizada com sucesso.', 'success');
