@@ -898,7 +898,14 @@
                     .eq('id', session.user.id)
                     .single());
                 
-                if (error || !data) return;
+                if (error || !data) {
+                    if (!window.__profileReadWarned && error?.message) {
+                        window.__profileReadWarned = true;
+                        console.warn('[Auth] Não foi possível ler o perfil do usuário (provável RLS):', error);
+                        showToast('Sem permissão para ler seu perfil no servidor. Ajuste as policies (RLS) do Supabase.', 'warning');
+                    }
+                    return;
+                }
                 
                 const c = snakeToCamel(data);
                 c.profile_completed = data.profile_completed;
@@ -2050,11 +2057,11 @@
                             if (navigator.onLine) {
                                 try {
                                     const localUser = await db.users.get(user.id);
-                                    const { data, error } = await supabaseClient
+                                    const { data, error } = await enqueueSupabaseAuth(() => supabaseClient
                                         .from('users')
                                         .select('*')
                                         .eq('id', user.id)
-                                        .single();
+                                        .single());
                                     
                                     if (!error && data) {
                                         if (localUser?.profileCompleted && !data.profile_completed) {
@@ -2067,6 +2074,12 @@
                                             profile = data;
                                             // Cachear perfil no Dexie para uso offline
                                             await db.users.put(snakeToCamel(profile));
+                                        }
+                                    } else if (error) {
+                                        if (!window.__profileReadWarned) {
+                                            window.__profileReadWarned = true;
+                                            console.warn('[Auth] Não foi possível ler o perfil do usuário (provável RLS):', error);
+                                            showToast('Sem permissão para ler seu perfil no servidor. Ajuste as policies (RLS) do Supabase.', 'warning');
                                         }
                                     }
                                 } catch (e) {
