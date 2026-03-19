@@ -8,6 +8,12 @@
     <meta name="theme-color" content="#1B4332">
     <!-- Ajuste do manifest para GitHub Pages -->
     <link rel="manifest" href="./manifest.json">
+    <script>
+        if (location.protocol === 'file:') {
+            const m = document.querySelector('link[rel="manifest"]');
+            if (m) m.remove();
+        }
+    </script>
     <link rel="shortcut icon" href="https://cdn-icons-png.flaticon.com/512/2830/2830531.png" type="image/png">
     <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/2830/2830531.png">
     <script src="https://cdn.tailwindcss.com"></script>
@@ -29,7 +35,7 @@
         const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
             auth: {
                 persistSession: true,
-                autoRefreshToken: false,
+                autoRefreshToken: true,
                 detectSessionInUrl: false,
                 storage: __supabaseStorage
             }
@@ -277,6 +283,17 @@
         }
         .toast.show {
             right: 1rem;
+        }
+
+        .driver-truck-marker {
+            width: 28px;
+            height: 28px;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid #ffffff;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.35);
         }
         
         /* Pulse animation for recording */
@@ -751,6 +768,17 @@
             syncQueue: '++id, action, tableName, itemId, data, timestamp, retries, status',
             routeSessions: 'id, routeId, frontId, farmId, driverId, startTime, endTime, distanceKm, durationMin, status, createdAt, updatedAt'
         });
+        db.version(4).stores({
+            harvestFronts: 'id, name, status, createdAt, updatedAt',
+            routes: 'id, frontId, farmId, startTime, status, createdAt, updatedAt, *tags',
+            drivers: 'id, name, status, assignedFront, createdAt, updatedAt',
+            farms: 'id, name, status, createdAt, updatedAt',
+            users: 'id, name, role, email, status, profile_completed',
+            settings: 'key',
+            syncQueue: '++id, action, tableName, itemId, data, timestamp, retries, status',
+            routeSessions: 'id, routeId, frontId, farmId, driverId, startTime, endTime, distanceKm, durationMin, status, createdAt, updatedAt',
+            driverLocations: 'id, updatedAt'
+        });
         
         // Add hooks for sync queue when we're back online
         db.on('ready', () => {
@@ -969,7 +997,8 @@
             'drivers': 'drivers',
             'farms': 'farms',
             'users': 'users',
-            'routeSessions': 'route_sessions'
+            'routeSessions': 'route_sessions',
+            'driverLocations': 'driver_locations'
         };
 
         // Sincronização delta otimizada com reconciliação de deleções
@@ -979,7 +1008,7 @@
             const { data: { session } } = await getSessionSafe();
             if (!session) return;
             
-            const dexieTables = ['harvestFronts', 'routes', 'drivers', 'farms', 'users', 'routeSessions'];
+            const dexieTables = ['harvestFronts', 'routes', 'drivers', 'farms', 'users', 'routeSessions', 'driverLocations'];
             const startTime = performance.now();
             
             console.log('[Sync] Iniciando sincronização delta e reconciliação...');
@@ -992,89 +1021,95 @@
                 for (let i = 0; i < dexieTables.length; i += BATCH_SIZE) {
                     const batch = dexieTables.slice(i, i + BATCH_SIZE);
                     const batchPromises = batch.map(async (dexieTableName) => {
-                        const supabaseTableName = TABLE_MAP[dexieTableName];
-                        let updatedCount = 0;
-                        
-                        // 1. DELTA SYNC (Updates/Inserts)
-                        const lastSyncKey = `lastSync_${dexieTableName}`;
-                        const lastSyncSetting = await db.settings.get(lastSyncKey);
-                        const lastSyncTime = lastSyncSetting ? lastSyncSetting.value : '1970-01-01T00:00:00Z';
-                        
-                        if (dexieTableName === 'users') {
-                            const currentRole = AppState.currentUser?.role || null;
-                            let query = supabaseClient.from('users').select('*');
-                            if (!(currentRole === 'admin' || currentRole === 'leader')) {
-                                query = query.eq('id', session.user.id).limit(1);
+                        try {
+                            const supabaseTableName = TABLE_MAP[dexieTableName];
+                            let updatedCount = 0;
+                            const numericIdTables = ['farms', 'harvestFronts', 'drivers', 'routes', 'routeSessions'];
+                            
+                            // 1. DELTA SYNC (Updates/Inserts)
+                            const lastSyncKey = `lastSync_${dexieTableName}`;
+                            const lastSyncSetting = await db.settings.get(lastSyncKey);
+                            const lastSyncTime = lastSyncSetting ? lastSyncSetting.value : '1970-01-01T00:00:00Z';
+                            
+                            if (dexieTableName === 'users') {
+                                const currentRole = AppState.currentUser?.role || null;
+                                let query = supabaseClient.from('users').select('*');
+                                if (!(currentRole === 'admin' || currentRole === 'leader')) {
+                                    query = query.eq('id', session.user.id).limit(1);
+                                } else {
+                                    query = query.limit(1000);
+                                }
+                                
+                                const { data: allUsers, error: allUsersError } = await query;
+                                if (allUsersError) throw allUsersError;
+                                
+                                const camelUsers = (allUsers || []).map(item => {
+                                    const c = snakeToCamel(item);
+                                    c.profile_completed = item.profile_completed;
+                                    c.profileCompleted = item.profile_completed;
+                                    return c;
+                                });
+                                await db.users.bulkPut(camelUsers);
+                                try {
+                                    const me = camelUsers.find(u => String(u.id) === String(session.user.id));
+                                    if (me) updateCurrentUserFromProfile(me);
+                                } catch (e) {}
+                                
+                                await db.settings.put({ key: lastSyncKey, value: new Date().toISOString() });
+                                totalUpdated += camelUsers.length;
+                                updatedCount = camelUsers.length;
                             } else {
-                                query = query.limit(1000);
-                            }
-                            
-                            const { data: allUsers, error: allUsersError } = await query;
-                            if (allUsersError) throw allUsersError;
-                            
-                            const camelUsers = (allUsers || []).map(item => {
-                                const c = snakeToCamel(item);
-                                c.profile_completed = item.profile_completed;
-                                c.profileCompleted = item.profile_completed;
-                                return c;
-                            });
-                            await db.users.bulkPut(camelUsers);
-                            try {
-                                const me = camelUsers.find(u => String(u.id) === String(session.user.id));
-                                if (me) updateCurrentUserFromProfile(me);
-                            } catch (e) {}
-                            
-                            await db.settings.put({ key: lastSyncKey, value: new Date().toISOString() });
-                            totalUpdated += camelUsers.length;
-                            updatedCount = camelUsers.length;
-                        } else {
-                            const timestampColumn = 'updated_at';
-                            
-                            let query = supabaseClient.from(supabaseTableName).select('*');
-                            if (lastSyncSetting) {
-                                query = query.gt(timestampColumn, lastSyncTime);
-                            }
-                            
-                            const { data: deltas, error: deltaError } = await query.limit(1000);
-                            if (deltaError) throw deltaError;
-                            
-                            if (deltas && deltas.length > 0) {
-                                const validDeltas = deltas.filter(item => !isNaN(item.id) || /^\d+$/.test(item.id));
+                                const timestampColumn = 'updated_at';
                                 
-                                const camelDeltas = validDeltas.map(item => snakeToCamel(item));
-                                await db[dexieTableName].bulkPut(camelDeltas);
+                                let query = supabaseClient.from(supabaseTableName).select('*');
+                                if (lastSyncSetting) {
+                                    query = query.gt(timestampColumn, lastSyncTime);
+                                }
                                 
-                                const maxTimestamp = deltas.reduce((max, item) => 
-                                    item[timestampColumn] > max ? item[timestampColumn] : max, lastSyncTime);
-                                await db.settings.put({ key: lastSyncKey, value: maxTimestamp });
-                                totalUpdated += validDeltas.length;
-                                updatedCount = deltas.length;
+                                const { data: deltas, error: deltaError } = await query.limit(1000);
+                                if (deltaError) throw deltaError;
+                                
+                                if (deltas && deltas.length > 0) {
+                                    const validDeltas = numericIdTables.includes(dexieTableName)
+                                        ? deltas.filter(item => !isNaN(item.id) || /^\d+$/.test(item.id))
+                                        : deltas;
+                                    
+                                    const camelDeltas = validDeltas.map(item => snakeToCamel(item));
+                                    await db[dexieTableName].bulkPut(camelDeltas);
+                                    
+                                    const maxTimestamp = deltas.reduce((max, item) => 
+                                        item[timestampColumn] > max ? item[timestampColumn] : max, lastSyncTime);
+                                    await db.settings.put({ key: lastSyncKey, value: maxTimestamp });
+                                    totalUpdated += validDeltas.length;
+                                    updatedCount = deltas.length;
+                                }
                             }
-                        }
-
-                        // 2. RECONCILIAÇÃO DE DELEÇÕES (Sync offline deletions)
-                        // Buscamos apenas os IDs do servidor para comparar com o local
-                        const { data: serverIds, error: idError } = await supabaseClient
-                            .from(supabaseTableName)
-                            .select('id');
-                        
-                        if (idError) throw idError;
-                        
-                        if (serverIds) {
-                            const localIds = await db[dexieTableName].toCollection().primaryKeys();
-                            const serverIdSet = new Set(serverIds.map(item => String(item.id)));
                             
-                            // IDs que existem localmente mas não existem mais no servidor
-                            const idsToDelete = localIds.filter(id => !serverIdSet.has(String(id)));
+                            // 2. RECONCILIAÇÃO DE DELEÇÕES
+                            const { data: serverIds, error: idError } = await supabaseClient
+                                .from(supabaseTableName)
+                                .select('id');
                             
-                            if (idsToDelete.length > 0) {
-                                console.log(`[Sync] Removendo ${idsToDelete.length} itens deletados do servidor em ${dexieTableName}`);
-                                await db[dexieTableName].bulkDelete(idsToDelete);
-                                totalDeleted += idsToDelete.length;
+                            if (idError) throw idError;
+                            
+                            if (serverIds) {
+                                const localIds = await db[dexieTableName].toCollection().primaryKeys();
+                                const serverIdSet = new Set(serverIds.map(item => String(item.id)));
+                                
+                                const idsToDelete = localIds.filter(id => !serverIdSet.has(String(id)));
+                                
+                                if (idsToDelete.length > 0) {
+                                    console.log(`[Sync] Removendo ${idsToDelete.length} itens deletados do servidor em ${dexieTableName}`);
+                                    await db[dexieTableName].bulkDelete(idsToDelete);
+                                    totalDeleted += idsToDelete.length;
+                                }
                             }
+                            
+                            return { updated: updatedCount };
+                        } catch (e) {
+                            console.warn(`[Sync] Falha ao sincronizar ${dexieTableName}.`, e);
+                            return { updated: 0 };
                         }
-                        
-                        return { updated: updatedCount };
                     });
                     
                     await Promise.all(batchPromises);
@@ -1115,7 +1150,9 @@
                     'farms': 1,
                     'harvestFronts': 2,
                     'drivers': 3,
-                    'routes': 4
+                    'routes': 4,
+                    'routeSessions': 5,
+                    'driverLocations': 6
                 };
                 
                 let queueItems = await db.syncQueue.orderBy('timestamp').toArray();
@@ -1337,6 +1374,8 @@
                         updateSyncUI(processedCount, totalItems, `Erro em ${itemName}`);
                         if (item.tableName === 'users') {
                             showToast(`Falha ao enviar usuário para o servidor: ${error.message || error}`, 'error');
+                        } else if (item.tableName === 'driverLocations') {
+                            showToast(`Falha ao enviar localização. Verifique permissões no Supabase (RLS).`, 'error');
                         }
                         
                         if (item.id) {
@@ -1395,7 +1434,7 @@
         
         // Setup Supabase Realtime listeners
         function setupSupabaseListeners() {
-            const dexieTables = ['harvestFronts', 'routes', 'drivers', 'farms', 'users'];
+            const dexieTables = ['harvestFronts', 'routes', 'drivers', 'farms', 'users', 'routeSessions', 'driverLocations'];
             
             dexieTables.forEach(dexieTableName => {
                 const supabaseTableName = TABLE_MAP[dexieTableName];
@@ -1804,6 +1843,123 @@
                 await db.routeSessions.update(sessionId, { trackPath, updatedAt: new Date().toISOString() });
             } catch (e) {}
         }
+
+        let driverLocationState = {
+            watchId: null,
+            lastSentAt: 0,
+            lastLat: null,
+            lastLng: null
+        };
+        
+        async function maybeUpdateDriverLocation(lat, lng, accuracy, speedKmh, heading) {
+            try {
+                if (!AppState.currentUser?.id || !isDriverRole(AppState.currentUser?.role)) return;
+                
+                const now = Date.now();
+                const lastAt = driverLocationState.lastSentAt || 0;
+                if (now - lastAt < 15000) return;
+                
+                if (driverLocationState.lastLat != null && driverLocationState.lastLng != null) {
+                    const movedKm = haversineDistance(driverLocationState.lastLat, driverLocationState.lastLng, lat, lng);
+                    if (movedKm < 0.03 && now - lastAt < 60000) return;
+                }
+                
+                driverLocationState.lastSentAt = now;
+                driverLocationState.lastLat = lat;
+                driverLocationState.lastLng = lng;
+                
+                const ts = new Date().toISOString();
+                const row = {
+                    id: AppState.currentUser.id,
+                    email: AppState.currentUser.email || null,
+                    name: AppState.currentUser.name || null,
+                    lat: Number(lat),
+                    lng: Number(lng),
+                    accuracy: accuracy != null ? Math.round(Number(accuracy)) : null,
+                    speedKmh: speedKmh != null ? Number(speedKmh) : null,
+                    heading: heading != null ? Number(heading) : null,
+                    status: 'active',
+                    createdAt: ts,
+                    updatedAt: ts
+                };
+                
+                try {
+                    await db.driverLocations.put(row);
+                } catch (e) {}
+
+                let sent = false;
+                try {
+                    if (navigator.onLine) {
+                        const { data: { session } } = await getSessionSafe();
+                        if (session) {
+                            const payload = camelToSnake(row);
+                            const { error } = await enqueueSupabaseAuth(() => supabaseClient
+                                .from('driver_locations')
+                                .upsert({ ...payload, id: row.id }, { onConflict: 'id' }));
+                            if (!error) {
+                                sent = true;
+                            } else if (!window.__driverLocationWriteWarned) {
+                                window.__driverLocationWriteWarned = true;
+                                showToast('Não foi possível enviar sua localização para o servidor (RLS/permissão).', 'warning');
+                            }
+                        }
+                    }
+                } catch (e) {}
+                
+                if (!sent) {
+                    addToSyncQueue('update', 'driverLocations', row.id, row);
+                }
+            } catch (e) {}
+        }
+        
+        function startDriverLocationTracking() {
+            try {
+                if (!navigator.geolocation) return;
+                if (!AppState.currentUser?.id || !isDriverRole(AppState.currentUser?.role)) return;
+                if (navigationState.active) return;
+                if (driverLocationState.watchId) return;
+                
+                navigator.geolocation.getCurrentPosition((pos) => {
+                    try {
+                        if (!pos?.coords) return;
+                        const lat = pos.coords.latitude;
+                        const lng = pos.coords.longitude;
+                        const accuracy = pos.coords.accuracy;
+                        const speedKmh = pos.coords.speed ? pos.coords.speed * 3.6 : null;
+                        const heading = pos.coords.heading || null;
+                        maybeUpdateDriverLocation(lat, lng, accuracy, speedKmh, heading);
+                    } catch (e) {}
+                }, () => {
+                    showToast('Permita o acesso à localização para compartilhar no mapa.', 'warning');
+                }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 });
+                
+                driverLocationState.watchId = navigator.geolocation.watchPosition((pos) => {
+                    try {
+                        if (!pos?.coords) return;
+                        if (!isDriverRole(AppState.currentUser?.role)) return;
+                        if (navigationState.active) return;
+                        
+                        const lat = pos.coords.latitude;
+                        const lng = pos.coords.longitude;
+                        const accuracy = pos.coords.accuracy;
+                        const speedKmh = pos.coords.speed ? pos.coords.speed * 3.6 : null;
+                        const heading = pos.coords.heading || null;
+                        maybeUpdateDriverLocation(lat, lng, accuracy, speedKmh, heading);
+                    } catch (e) {}
+                }, () => {
+                    showToast('Não foi possível obter sua localização. Verifique o GPS.', 'warning');
+                }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 });
+            } catch (e) {}
+        }
+        
+        function stopDriverLocationTracking() {
+            try {
+                if (driverLocationState.watchId && navigator.geolocation) {
+                    navigator.geolocation.clearWatch(driverLocationState.watchId);
+                }
+            } catch (e) {}
+            driverLocationState.watchId = null;
+        }
         
         function beginNavigationWatch() {
             if (!navigator.geolocation) {
@@ -1811,6 +1967,8 @@
                 stopNavigation();
                 return;
             }
+            
+            stopDriverLocationTracking();
             
             const options = {
                 enableHighAccuracy: true,
@@ -2022,16 +2180,7 @@
         
         async function initializeSupabase() {
             try {
-                await enqueueSupabaseAuth(async () => {
-                    try {
-                        const stored = await db.settings.get('supabase_session');
-                        const tokens = stored?.value;
-                        const { data: { session } } = await supabaseClient.auth.getSession();
-                        if (!session && tokens?.refresh_token && tokens?.access_token) {
-                            await supabaseClient.auth.setSession(tokens);
-                        }
-                    } catch (e) {}
-                });
+                try { await supabaseClient.auth.getSession(); } catch (e) {}
 
                 // Subscribe to auth changes
                 supabaseClient.auth.onAuthStateChange(async (event, session) => {
@@ -2148,6 +2297,11 @@
                             updateUserHeader();
 
                             applyRolePermissions();
+                            if (isDriverRole(role)) {
+                                startDriverLocationTracking();
+                            } else {
+                                stopDriverLocationTracking();
+                            }
                             if (header) header.style.display = 'block';
                             if (nav) nav.style.display = 'block';
                             if (isDriverRole(role)) {
@@ -2189,6 +2343,7 @@
                         if (nav) nav.style.display = 'none';
                         
                         AppState.currentUser = { name: 'Usuário', email: null, role: 'leader' };
+                        stopDriverLocationTracking();
                         if (window.profileSyncInterval) clearInterval(window.profileSyncInterval);
                         clearActiveNavigationState();
                         renderLoginView();
@@ -3220,7 +3375,10 @@
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
                             <div class="bg-white dark:bg-gray-800 rounded-lg shadow">
                                 <div class="p-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
-                                    <h3 class="font-semibold">Mapa de Operações</h3>
+                                    <div>
+                                        <h3 class="font-semibold">Mapa de Operações</h3>
+                                        <div class="text-xs text-gray-500 dark:text-gray-400" id="drivers-online-count"></div>
+                                    </div>
                                     <button onclick="centerMapOnAllOperations()" class="text-sm text-primary-500 hover:text-primary-600 flex items-center focus:outline-none focus:underline">
                                         <i class="fas fa-expand-alt mr-1"></i> Visualizar tudo
                                     </button>
@@ -7044,6 +7202,7 @@
                 const isOffRoute = closest.distance > 80;
                 appendTrackPoint(lat, lng, Date.now(), speed, accuracy, isOffRoute);
                 persistTrackProgress();
+                maybeUpdateDriverLocation(lat, lng, accuracy, speed, heading);
                 
                 // ==========================================
                 // DETECÇÃO DE DESVIO DE ROTA (REROUTING)
@@ -7436,6 +7595,9 @@
             
             // Show toast
             showToast('Navegação parada', 'info');
+            if (isDriverRole(AppState.currentUser?.role)) {
+                startDriverLocationTracking();
+            }
         }
         
         function exitDriverNavigation() {
@@ -9989,6 +10151,10 @@
                                         <input type="radio" name="locationMethod" value="manual" onchange="toggleFarmLocationMethod()" class="form-radio text-primary-600">
                                         <span class="ml-2">Coordenadas Manuais</span>
                                     </label>
+                                    <label class="inline-flex items-center cursor-pointer">
+                                        <input type="radio" name="locationMethod" value="link" onchange="toggleFarmLocationMethod()" class="form-radio text-primary-600">
+                                        <span class="ml-2">Link do Maps</span>
+                                    </label>
                                 </div>
                             </div>
 
@@ -10015,6 +10181,15 @@
                                 <p class="text-xs text-gray-500 mt-1">Copie e cole do Google Maps (ex: -17.7719, -50.4606).</p>
                                 <button type="button" onclick="previewManualCoordinates()" class="mt-2 px-3 py-1 bg-gray-200 dark:bg-gray-700 rounded text-sm hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors">
                                     <i class="fas fa-map-marker-alt mr-1"></i> Pré-visualizar no Mapa
+                                </button>
+                            </div>
+
+                            <div id="linkInputContainer" class="mb-6 hidden">
+                                <label for="farmLocationLink" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Link compartilhado do Google Maps</label>
+                                <input type="url" id="farmLocationLink" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-white" placeholder="https://maps.app.goo.gl/DTGxJKA9BEBPQpUM7">
+                                <p class="text-xs text-gray-500 mt-1">Se o link não tiver coordenadas visíveis, o app pode precisar que você cole a URL completa do Google Maps com “@lat,lng”.</p>
+                                <button type="button" onclick="previewFarmLink()" class="mt-2 px-3 py-1 bg-gray-200 dark:bg-gray-700 rounded text-sm hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors">
+                                    <i class="fas fa-link mr-1"></i> Ler link e pré-visualizar
                                 </button>
                             </div>
                             
@@ -10045,19 +10220,147 @@
             const method = document.querySelector('input[name="locationMethod"]:checked').value;
             const kmlContainer = document.getElementById('kmlInputContainer');
             const manualContainer = document.getElementById('manualInputContainer');
+            const linkContainer = document.getElementById('linkInputContainer');
             
             if (method === 'kml') {
                 kmlContainer.classList.remove('hidden');
                 manualContainer.classList.add('hidden');
+                if (linkContainer) linkContainer.classList.add('hidden');
             } else {
-                kmlContainer.classList.add('hidden');
-                manualContainer.classList.remove('hidden');
+                if (method === 'manual') {
+                    kmlContainer.classList.add('hidden');
+                    manualContainer.classList.remove('hidden');
+                    if (linkContainer) linkContainer.classList.add('hidden');
+                } else {
+                    kmlContainer.classList.add('hidden');
+                    manualContainer.classList.add('hidden');
+                    if (linkContainer) linkContainer.classList.remove('hidden');
+                }
             }
             
             // Clear preview
             currentFarmGeoJson = null;
             const container = document.getElementById('farmMapPreviewContainer');
             if (container) container.classList.add('hidden');
+        }
+
+        function createPointGeoJson(lat, lng, label) {
+            return {
+                type: "FeatureCollection",
+                features: [{
+                    type: "Feature",
+                    properties: { name: label || "Localização" },
+                    geometry: {
+                        type: "Point",
+                        coordinates: [lng, lat]
+                    }
+                }]
+            };
+        }
+
+        function parseLatLngFromText(text) {
+            const raw = String(text || '').trim();
+            if (!raw) return null;
+            
+            const atMatch = raw.match(/@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
+            if (atMatch) return { lat: parseFloat(atMatch[1]), lng: parseFloat(atMatch[2]) };
+            
+            const embedMatch = raw.match(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/);
+            if (embedMatch) return { lat: parseFloat(embedMatch[1]), lng: parseFloat(embedMatch[2]) };
+            
+            const pairMatch = raw.match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/);
+            if (pairMatch) return { lat: parseFloat(pairMatch[1]), lng: parseFloat(pairMatch[2]) };
+            
+            try {
+                const u = new URL(raw);
+                const q = u.searchParams.get('q') || u.searchParams.get('query') || u.searchParams.get('ll') || u.searchParams.get('center') || u.searchParams.get('destination') || u.searchParams.get('origin');
+                if (q) {
+                    const qm = String(q).match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/);
+                    if (qm) return { lat: parseFloat(qm[1]), lng: parseFloat(qm[2]) };
+                }
+                
+                const uText = decodeURIComponent(u.toString());
+                const atMatch2 = uText.match(/@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
+                if (atMatch2) return { lat: parseFloat(atMatch2[1]), lng: parseFloat(atMatch2[2]) };
+                
+                const embedMatch2 = uText.match(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/);
+                if (embedMatch2) return { lat: parseFloat(embedMatch2[1]), lng: parseFloat(embedMatch2[2]) };
+            } catch (e) {}
+            
+            return null;
+        }
+
+        async function resolveAndParseGoogleMapsLink(url) {
+            const direct = parseLatLngFromText(url);
+            if (direct && !isNaN(direct.lat) && !isNaN(direct.lng)) return direct;
+            
+            if (!navigator.onLine) {
+                throw new Error('Você está offline. Cole um link que contenha coordenadas (ex: .../@lat,lng...) ou use coordenadas manuais.');
+            }
+            
+            const input = String(url || '').trim();
+            if (!input) throw new Error('Cole o link do Google Maps.');
+            
+            let finalUrl = input;
+            try {
+                const res = await fetch(input, { redirect: 'follow' });
+                if (res && res.url) finalUrl = res.url;
+            } catch (e) {
+                try {
+                    const res = await fetch(input, { redirect: 'follow', mode: 'no-cors' });
+                    if (res && res.url) finalUrl = res.url;
+                } catch (e2) {}
+            }
+            
+            const parsed = parseLatLngFromText(finalUrl);
+            if (parsed && !isNaN(parsed.lat) && !isNaN(parsed.lng)) return parsed;
+
+            try {
+                const proxyUrl = input.startsWith('http://')
+                    ? `https://r.jina.ai/http://${input.slice('http://'.length)}`
+                    : input.startsWith('https://')
+                        ? `https://r.jina.ai/https://${input.slice('https://'.length)}`
+                        : `https://r.jina.ai/https://${input}`;
+                
+                const res = await fetch(proxyUrl);
+                if (res && res.ok) {
+                    const text = await res.text();
+                    const parsedFromHtml = parseLatLngFromText(text);
+                    if (parsedFromHtml && !isNaN(parsedFromHtml.lat) && !isNaN(parsedFromHtml.lng)) return parsedFromHtml;
+                }
+            } catch (e) {}
+            
+            throw new Error('Não consegui extrair coordenadas desse link. Abra o link e copie a URL completa do Google Maps (geralmente contém “@lat,lng”).');
+        }
+
+        async function previewFarmLink() {
+            const input = document.getElementById('farmLocationLink')?.value || '';
+            try {
+                showLoading('Lendo link...');
+                const { lat, lng } = await resolveAndParseGoogleMapsLink(input);
+                
+                currentFarmGeoJson = createPointGeoJson(lat, lng, "Localização pelo Link");
+                
+                const container = document.getElementById('farmMapPreviewContainer');
+                if (container) container.classList.remove('hidden');
+                
+                if (!currentFarmPreviewMap) {
+                    currentFarmPreviewMap = initMapWithLayers('farm-preview-map', [lat, lng], 15);
+                } else {
+                    currentFarmPreviewMap.eachLayer((layer) => {
+                        if (layer instanceof L.GeoJSON || layer instanceof L.Marker) {
+                            currentFarmPreviewMap.removeLayer(layer);
+                        }
+                    });
+                    currentFarmPreviewMap.setView([lat, lng], 15);
+                }
+                
+                L.marker([lat, lng]).addTo(currentFarmPreviewMap);
+            } catch (e) {
+                showToast(e.message || 'Falha ao ler link.', 'error');
+            } finally {
+                hideLoading();
+            }
         }
         
         function previewManualCoordinates() {
@@ -10078,19 +10381,7 @@
                 const lng = parts[1];
                 
                 // Create simple GeoJSON Point
-                const geojson = {
-                    type: "FeatureCollection",
-                    features: [{
-                        type: "Feature",
-                        properties: { name: "Localização Manual" },
-                        geometry: {
-                            type: "Point",
-                            coordinates: [lng, lat]
-                        }
-                    }]
-                };
-                
-                currentFarmGeoJson = geojson;
+                currentFarmGeoJson = createPointGeoJson(lat, lng, "Localização Manual");
                 
                 // Show map
                 const container = document.getElementById('farmMapPreviewContainer');
@@ -10241,17 +10532,7 @@
                     try {
                         const parts = input.split(',').map(p => parseFloat(p.trim()));
                         if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
-                            currentFarmGeoJson = {
-                                type: "FeatureCollection",
-                                features: [{
-                                    type: "Feature",
-                                    properties: { name: "Localização Manual" },
-                                    geometry: {
-                                        type: "Point",
-                                        coordinates: [parts[1], parts[0]]
-                                    }
-                                }]
-                            };
+                            currentFarmGeoJson = createPointGeoJson(parts[0], parts[1], "Localização Manual");
                         }
                     } catch (e) {
                         console.error('Erro ao processar coordenadas manuais no salvamento:', e);
@@ -10259,8 +10540,21 @@
                 }
             }
             
+            if (method === 'link' && !currentFarmGeoJson) {
+                const link = document.getElementById('farmLocationLink')?.value || '';
+                try {
+                    showLoading('Lendo link...');
+                    const { lat, lng } = await resolveAndParseGoogleMapsLink(link);
+                    currentFarmGeoJson = createPointGeoJson(lat, lng, "Localização pelo Link");
+                } catch (e) {
+                    showToast(e.message || 'Falha ao ler link.', 'error');
+                } finally {
+                    hideLoading();
+                }
+            }
+            
             if (!name || !currentFarmGeoJson) {
-                showToast('Por favor, preencha o nome e importe um KML ou digite coordenadas válidas.', 'warning');
+                showToast('Por favor, preencha o nome e informe a localização (KML, coordenadas ou link).', 'warning');
                 return;
             }
 
@@ -11306,6 +11600,42 @@
         // ==========================================
         // Operations Map Functions
         // ==========================================
+
+        function buildDriverTruckIcon(color) {
+            const bg = color || '#22c55e';
+            return L.divIcon({
+                className: '',
+                html: `<div class="driver-truck-marker" style="background-color:${bg};"><i class="fas fa-truck" style="color:#ffffff; font-size:14px;"></i></div>`,
+                iconSize: [28, 28],
+                iconAnchor: [14, 14]
+            });
+        }
+        
+        async function refreshDriverLocationsFromServer() {
+            try {
+                if (!navigator.onLine) return;
+                if (!db.driverLocations?.bulkPut) return;
+                
+                const { data: { session } } = await getSessionSafe();
+                if (!session) return;
+                
+                const { data, error } = await enqueueSupabaseAuth(() => supabaseClient
+                    .from('driver_locations')
+                    .select('id,email,name,lat,lng,accuracy,speed_kmh,heading,updated_at')
+                    .limit(1000));
+                
+                if (error) {
+                    if (!window.__driverLocationsReadWarned) {
+                        window.__driverLocationsReadWarned = true;
+                        showToast('Sem permissão para ver localização dos motoristas (RLS).', 'warning');
+                    }
+                    return;
+                }
+                
+                const rows = (data || []).map(r => snakeToCamel(r));
+                await db.driverLocations.bulkPut(rows);
+            } catch (e) {}
+        }
         
         function initOperationsMap() {
             const mapContainer = document.getElementById('operations-map');
@@ -11320,13 +11650,21 @@
 
                 const map = initMapWithLayers('operations-map', [-15.7801, -47.9292], 5);
                 window.operationsMap = map;
+                if (window.operationsDriversInterval) {
+                    clearInterval(window.operationsDriversInterval);
+                    window.operationsDriversInterval = null;
+                }
                 
                 // Load data in parallel
                 Promise.all([
                     db.routes.where('status').equals('active').toArray(),
                     db.harvestFronts.toArray(),
-                    db.farms.toArray()
-                ]).then(([routes, fronts, farms]) => {
+                    db.farms.toArray(),
+                    (async () => {
+                        await refreshDriverLocationsFromServer();
+                        return db.driverLocations?.toArray ? db.driverLocations.toArray() : Promise.resolve([]);
+                    })()
+                ]).then(([routes, fronts, farms, driverLocations]) => {
                     const bounds = L.latLngBounds([]);
                     let hasVisibleItems = false;
                     
@@ -11411,6 +11749,74 @@
                             });
                         });
                     }
+
+                    try {
+                        if (window.operationsDriversLayer) {
+                            map.removeLayer(window.operationsDriversLayer);
+                            window.operationsDriversLayer = null;
+                        }
+                        const layer = L.featureGroup().addTo(map);
+                        window.operationsDriversLayer = layer;
+                        
+                        const now = Date.now();
+                        let driversCount = 0;
+                        (driverLocations || []).forEach(loc => {
+                            const lat = Number(loc.lat);
+                            const lng = Number(loc.lng);
+                            if (isNaN(lat) || isNaN(lng)) return;
+                            driversCount++;
+                            
+                            const updatedAt = loc.updatedAt ? new Date(loc.updatedAt).getTime() : 0;
+                            const ageMin = updatedAt ? (now - updatedAt) / 60000 : 9999;
+                            const color = ageMin <= 2 ? '#22c55e' : (ageMin <= 10 ? '#f59e0b' : '#9ca3af');
+                            
+                            const title = loc.name || loc.email || 'Motorista';
+                            const ageText = ageMin < 1 ? '< 1 min' : `${Math.round(ageMin)} min`;
+                            const marker = L.marker([lat, lng], { icon: buildDriverTruckIcon(color) });
+                            marker.bindTooltip(`${title} • ${ageText} atrás`, { sticky: true });
+                            marker.addTo(layer);
+                            
+                            bounds.extend([lat, lng]);
+                            hasVisibleItems = true;
+                        });
+                        
+                        const countEl = document.getElementById('drivers-online-count');
+                        if (countEl) {
+                            countEl.textContent = driversCount > 0 ? `Motoristas no mapa: ${driversCount}` : 'Sem localização de motoristas ainda';
+                        }
+                        
+                        window.operationsDriversInterval = setInterval(async () => {
+                            try {
+                                if (!window.operationsMap || !window.operationsDriversLayer) return;
+                                await refreshDriverLocationsFromServer();
+                                const fresh = await (db.driverLocations?.toArray ? db.driverLocations.toArray() : Promise.resolve([]));
+                                window.operationsDriversLayer.clearLayers();
+                                const now2 = Date.now();
+                                let driversCount2 = 0;
+                                fresh.forEach(loc => {
+                                    const lat = Number(loc.lat);
+                                    const lng = Number(loc.lng);
+                                    if (isNaN(lat) || isNaN(lng)) return;
+                                    driversCount2++;
+                                    
+                                    const updatedAt = loc.updatedAt ? new Date(loc.updatedAt).getTime() : 0;
+                                    const ageMin = updatedAt ? (now2 - updatedAt) / 60000 : 9999;
+                                    const color = ageMin <= 2 ? '#22c55e' : (ageMin <= 10 ? '#f59e0b' : '#9ca3af');
+                                    
+                                    const title = loc.name || loc.email || 'Motorista';
+                                    const ageText = ageMin < 1 ? '< 1 min' : `${Math.round(ageMin)} min`;
+                                    const marker = L.marker([lat, lng], { icon: buildDriverTruckIcon(color) });
+                                    marker.bindTooltip(`${title} • ${ageText} atrás`, { sticky: true });
+                                    marker.addTo(window.operationsDriversLayer);
+                                });
+                                
+                                const countEl2 = document.getElementById('drivers-online-count');
+                                if (countEl2) {
+                                    countEl2.textContent = driversCount2 > 0 ? `Motoristas no mapa: ${driversCount2}` : 'Sem localização de motoristas ainda';
+                                }
+                            } catch (e) {}
+                        }, 10000);
+                    } catch (e) {}
                     
                     if (hasVisibleItems && bounds.isValid()) {
                         map.fitBounds(bounds, { padding: [30, 30] });
@@ -11438,12 +11844,16 @@
                 // Similar to initOperationsMap but just recenter
                 Promise.all([
                     db.routes.where('status').equals('active').toArray(),
-                    db.farms.toArray()
-                ]).then(([routes, farms]) => {
+                    db.farms.toArray(),
+                    (async () => {
+                        await refreshDriverLocationsFromServer();
+                        return db.driverLocations?.toArray ? db.driverLocations.toArray() : Promise.resolve([]);
+                    })()
+                ]).then(([routes, farms, driverLocations]) => {
                     const bounds = L.latLngBounds([]);
                     let hasVisibleItems = false;
                     
-                    if (routes.length === 0 && farms.length === 0) {
+                    if (routes.length === 0 && farms.length === 0 && (!driverLocations || driverLocations.length === 0)) {
                         showToast('Nenhuma atividade para mostrar', 'info');
                         return;
                     }
@@ -11475,6 +11885,14 @@
                                 // Ignore errors for bounds calculation
                             }
                         }
+                    });
+                    
+                    (driverLocations || []).forEach(loc => {
+                        const lat = Number(loc.lat);
+                        const lng = Number(loc.lng);
+                        if (isNaN(lat) || isNaN(lng)) return;
+                        bounds.extend([lat, lng]);
+                        hasVisibleItems = true;
                     });
                     
                     if (hasVisibleItems && bounds.isValid()) {
